@@ -1,0 +1,75 @@
+# Переменные окружения
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Виртуальные окружения
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# Базы данных
+*.db
+*.sqlite
+*.sqlite3
+data/users.db
+database.db
+
+# Логи
+*.log
+log_file.log
+logs/
+
+# IDE и редакторы
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Временные файлы
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Конфигурационные файлы с секретами
+config.ini
+secrets.json
+credentials.json
+
+# Google Sheets API
+token.json
+credentials.json
+
+# Другие
+*.pid
+*.seed
+*.pid.lock
