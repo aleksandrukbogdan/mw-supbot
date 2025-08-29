@@ -23,6 +23,7 @@ from database import (
     set_topic_id, get_all_topic_ids, delete_all_topics
 )
 from logger import logger
+import telegram.error
 
 # Логируем версию Python при старте
 log = logger.get_logger('main')
@@ -50,7 +51,7 @@ TOPIC_NAMES = {
     "dashboard": "🕹️ Панель управления",
     "l1_requests": "Линия 1",
     "l2_support": "Линия 2",
-    "l3_billing": "Линия 3",
+    "l3_support": "Линия 3",
 }
 
 # Состояния для ConversationHandler
@@ -405,7 +406,7 @@ async def final_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             if ADMIN_CHAT_ID:
                 try:
                     # 1. Создаем новый топик для тикета
-                    topic_title = f"[New] Ticket #{entry_id_str} from @{username or fio}"
+                    topic_title = f"[Новый] Обращение #{entry_id_str} от @{username or fio}"
                     ticket_topic = await context.bot.create_forum_topic(chat_id=ADMIN_CHAT_ID, name=topic_title)
                     ticket_topic_id = ticket_topic.message_thread_id
                     
@@ -452,7 +453,7 @@ async def final_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                         try:
                             chat_link = f"https://t.me/c/{str(ADMIN_CHAT_ID).replace('-100', '')}"
                             ticket_url = f"{chat_link}/{ticket_topic_id}"
-                            l1_summary = (f"🆕 <b>Новый тикет #{entry_id_str}</b> от @{username or fio}\n"
+                            l1_summary = (f"🆕 <b>Новое обращение #{entry_id_str}</b> от @{username or fio}\n"
                                           f"<b>Тип:</b> {feedback_type}\n"
                                           f"<b>Приоритет:</b> <i>Не установлен</i>\n"
                                           f"<a href='{ticket_url}'>➡️ Перейти к тикету для установки приоритета</a>")
@@ -475,6 +476,9 @@ async def final_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 except Exception as e:
                     log.error(f"Не удалось отправить уведомление в чат админов по новой логике: {e}", exc_info=True)
                     reply_text += "\n\n⚠️ Не удалось уведомить администраторов. Пожалуйста, свяжитесь с ними напрямую."
+                finally:
+                    # Обновляем Dashboard в любом случае, даже если отправка в L1 не удалась
+                    await update_dashboard(context.application)
 
 
         else:
@@ -543,7 +547,7 @@ async def take_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ticket_info = context.bot_data.get('topic_ticket_info', {}).get(ticket_topic_id, {})
         username = ticket_info.get('username', 'user')
         fio = ticket_info.get('fio', '')
-        new_topic_name = f"[In Progress - {admin_identifier}] Ticket #{entry_id} from @{username or fio}"
+        new_topic_name = f"Тикет #{entry_id} [В работе - {admin_identifier}] от @{username or fio}"
         await context.bot.edit_forum_topic(chat_id=ADMIN_CHAT_ID, message_thread_id=ticket_topic_id, name=new_topic_name)
         log.info(f"Топик для тикета #{entry_id} переименован.")
     except Exception as e:
@@ -554,7 +558,7 @@ async def take_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # 4. Integration Point: Обновляем Google Sheets
     try:
-        await record_action(entry_id, 'taken', datetime.now(), status=f"В работе у {admin_identifier}")
+        await record_action(entry_id, 'taken', datetime.now(), status="На 1 линии")
         log.info(f"Статус тикета #{entry_id} обновлен в Google Sheets.")
     except Exception as e:
         log.error(f"Не удалось обновить Google Sheets для тикета #{entry_id}: {e}")
@@ -595,7 +599,8 @@ async def take_escalated_ticket(update: Update, context: ContextTypes.DEFAULT_TY
     logger.set_context(update)
 
     try:
-        _, _, ticket_topic_id_str, entry_id, user_id_str = query.data.split('_')
+        _, _, line, ticket_topic_id_str, entry_id, user_id_str = query.data.split('_')
+        line_number = line[1:] # l2 -> 2
         ticket_topic_id = int(ticket_topic_id_str)
         user_id = int(user_id_str)
     except (ValueError, IndexError) as e:
@@ -626,7 +631,7 @@ async def take_escalated_ticket(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         username = ticket_info.get('username', 'user')
         fio = ticket_info.get('fio', '')
-        new_topic_name = f"[In Progress - {admin_identifier}] Ticket #{entry_id} from @{username or fio}"
+        new_topic_name = f"Тикет #{entry_id} [В работе - {admin_identifier}] от @{username or fio}"
         await context.bot.edit_forum_topic(chat_id=ADMIN_CHAT_ID, message_thread_id=ticket_topic_id, name=new_topic_name)
         log.info(f"Топик для тикета #{entry_id} переименован.")
     except Exception as e:
@@ -634,6 +639,13 @@ async def take_escalated_ticket(update: Update, context: ContextTypes.DEFAULT_TY
 
     # Обновляем Dashboard
     await update_dashboard(context.application)
+
+    # Integration Point: Обновляем Google Sheets
+    try:
+        await record_action(entry_id, f'taken_l{line_number}', datetime.now(), status=f"На {line_number} линии")
+        log.info(f"Статус тикета #{entry_id} обновлен в Google Sheets на 'На {line_number} линии'.")
+    except Exception as e:
+        log.error(f"Не удалось обновить Google Sheets для тикета #{entry_id}: {e}")
 
     # Уведомляем пользователя
     try:
@@ -711,13 +723,21 @@ async def transfer_to_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"<a href='{ticket_url}'>➡️ Перейти к тикету</a>"
             )
 
-            await context.bot.send_message(
+            escalation_message = await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 message_thread_id=target_topic_id,
                 text=escalation_summary,
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
+            
+            # Сохраняем ID сообщения для последующего удаления
+            messages_for_ticket = context.bot_data.setdefault('l2_l3_messages', {}).setdefault(entry_id, [])
+            messages_for_ticket.append({
+                'message_id': escalation_message.message_id,
+                'topic_id': target_topic_id
+            })
+
             log.info(f"Уведомление об эскалации тикета #{entry_id} отправлено в топик L{line_number}")
         except Exception as e:
             log.error(f"Не удалось отправить уведомление об эскалации в топик L{line_number}: {e}")
@@ -729,7 +749,7 @@ async def transfer_to_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # 3. Integration Point: Обновляем Google Sheets
     try:
-        status = f"Передано на {line_number} линию"
+        status = f"На {line_number} линии"
         await record_action(entry_id, f'transfer_l{line_number}', datetime.now(), status=status)
         log.info(f"Статус тикета #{entry_id} обновлен в Google Sheets на '{status}'.")
     except Exception as e:
@@ -747,9 +767,21 @@ async def transfer_to_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # 5. Обновляем сообщение в самом тикете, СОХРАНЯЯ кнопки
     await query.edit_message_text(
-        text=query.message.text + f"\n\n---\n➡️ <b>Тикет эскалирован на L{line_number}</b> администратором {admin_identifier}.",
+        text=query.message.text + f"\n\n---\n➡️Тикет эскалирован на L{line_number} администратором {admin_identifier}.",
         reply_markup=query.message.reply_markup # Сохраняем исходные кнопки
     )
+
+    l2_l3_messages_list = context.bot_data.get('l2_l3_messages', {}).pop(entry_id, [])
+    if l2_l3_messages_list:
+        for message_info in l2_l3_messages_list:
+            try:
+                await context.bot.delete_message(
+                    chat_id=ADMIN_CHAT_ID, 
+                    message_id=message_info['message_id']
+                )
+                log.info(f"Уведомление для тикета #{entry_id} удалено из L2/L3.")
+            except Exception as e:
+                log.warning(f"Не удалось удалить уведомление из L2/L3 для тикета #{entry_id}: {e}")
 
 async def set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатие кнопок приоритета, что равносильно взятию тикета в работу."""
@@ -789,7 +821,7 @@ async def set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # 3. Обновляем Google Sheets (приоритет и статус/ответственный)
     try:
         await set_priority_and_sla(entry_id, priority)
-        await record_action(entry_id, 'taken', datetime.now(), status=f"В работе у {admin_identifier}")
+        await record_action(entry_id, 'taken', datetime.now(), status="На 1 линии")
         log.info(f"Google Sheets обновлен для тикета #{entry_id}: приоритет={priority}, ответственный={admin_identifier}")
     except Exception as e:
         log.error(f"Не удалось обновить Google Sheets для тикета #{entry_id}: {e}")
@@ -800,22 +832,22 @@ async def set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         username = ticket_info.get('username', 'user')
         fio = ticket_info.get('fio', '')
-        new_topic_name = f"[In Progress - {admin_identifier}] Ticket #{entry_id} from @{username or fio}"
+        new_topic_name = f"Тикет #{entry_id} [В работе - {admin_identifier}]  от @{username or fio}"
         await context.bot.edit_forum_topic(chat_id=ADMIN_CHAT_ID, message_thread_id=ticket_topic_id, name=new_topic_name)
     except Exception as e:
         log.error(f"Не удалось переименовать топик {ticket_topic_id}: {e}")
  
-    # 5. Удаляем уведомление из L1
-    l1_message_id = context.bot_data.get('l1_messages', {}).pop(entry_id, None)
-    l1_topic_id = context.bot_data.get("l1_requests_topic_id")
-    if l1_message_id and l1_topic_id:
-        try:
-            await context.bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=l1_message_id)
-            log.info(f"Уведомление для тикета #{entry_id} удалено из L1.")
-        except Exception as e:
-            log.warning(f"Не удалось удалить уведомление из L1 для тикета #{entry_id}: {e}")
-    else:
-        log.warning(f"Не найден ID сообщения L1 для тикета #{entry_id}, не могу удалить.")
+    # 5. Удаляем уведомление из L1 - Убрано по требованию 
+    # l1_message_id = context.bot_data.get('l1_messages', {}).pop(entry_id, None)
+    # l1_topic_id = context.bot_data.get("l1_requests_topic_id")
+    # if l1_message_id and l1_topic_id:
+    #     try:
+    #         await context.bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=l1_message_id)
+    #         log.info(f"Уведомление для тикета #{entry_id} удалено из L1.")
+    #     except Exception as e:
+    #         log.warning(f"Не удалось удалить уведомление из L1 для тикета #{entry_id}: {e}")
+    # else:
+    #     log.warning(f"Не найден ID сообщения L1 для тикета #{entry_id}, не могу удалить.")
  
     # 6. Уведомляем пользователя
     try:
@@ -1424,16 +1456,29 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.message.reply_text(f"⚠️ Ошибка при обновлении Google Sheets: {e}")
         # Не продолжаем, если не смогли записать в GS
         return
-
-    # 2. Удаляем сообщение из Dashboard
-    dashboard_message_id = context.bot_data.get('dashboard_messages', {}).get(entry_id)
-    if dashboard_message_id:
-        try:
-            await context.bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=dashboard_message_id)
-            log.info(f"Сообщение о тикете #{entry_id} удалено из дашборда.")
-        except Exception as e:
-            log.warning(f"Не удалось удалить сообщение ({dashboard_message_id}) из дашборда для тикета #{entry_id}: {e}")
     
+    # 2. Удаляем уведомления из топиков L1/L2/L3
+    l1_message_id = context.bot_data.get('l1_messages', {}).pop(entry_id, None)
+    l1_topic_id = context.bot_data.get("l1_requests_topic_id")
+    if l1_message_id and l1_topic_id:
+        try:
+            await context.bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=l1_message_id)
+            log.info(f"Уведомление для тикета #{entry_id} удалено из L1.")
+        except Exception as e:
+            log.warning(f"Не удалось удалить уведомление из L1 для тикета #{entry_id}: {e}")
+
+    l2_l3_messages_list = context.bot_data.get('l2_l3_messages', {}).pop(entry_id, [])
+    if l2_l3_messages_list:
+        for message_info in l2_l3_messages_list:
+            try:
+                await context.bot.delete_message(
+                    chat_id=ADMIN_CHAT_ID, 
+                    message_id=message_info['message_id']
+                )
+                log.info(f"Уведомление для тикета #{entry_id} удалено из L2/L3.")
+            except Exception as e:
+                log.warning(f"Не удалось удалить уведомление из L2/L3 для тикета #{entry_id}: {e}")
+
     # 3. Уведомляем пользователя
     try:
         await context.bot.send_message(
@@ -1444,11 +1489,22 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     except Exception as e:
         log.error(f"Не удалось уведомить пользователя {user_id} о закрытии: {e}")
 
-    # 4. Архивируем топик
+    # 4. Удаляем данные о тикете из bot_data ДО обновления дашборда
+    context.bot_data.get('user_ticket_topics', {}).pop(user_id, None)
+    original_topic_info = context.bot_data.get('topic_ticket_info', {}).pop(ticket_topic_id, None)
+    log.info(f"Временные данные для тикета #{entry_id} очищены.")
+
+    # 5. Обновляем Dashboard после удаления данных
+    await update_dashboard(context.application)
+
+    # 6. Архивируем топик
     try:
-        original_topic_info = context.bot_data.get('topic_ticket_info', {}).get(ticket_topic_id)
-        original_name = f"Ticket #{entry_id} from @{original_topic_info.get('username', 'user')}" # Формируем базовое имя
-        closed_topic_name = f"[Closed] {original_name}"
+        if original_topic_info:
+            original_name = f"Обращение #{entry_id} от @{original_topic_info.get('username', 'user')}"
+        else:
+            original_name = f"Обращение #{entry_id}"
+
+        closed_topic_name = f"[Закрыт] {original_name}"
         
         await context.bot.edit_forum_topic(
             chat_id=ADMIN_CHAT_ID,
@@ -1464,15 +1520,9 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await context.bot.close_forum_topic(chat_id=ADMIN_CHAT_ID, message_thread_id=ticket_topic_id)
         log.info(f"Топик {ticket_topic_id} для тикета #{entry_id} закрыт и архивирован.")
     except Exception as e:
-        log.error(f"Не удалось закрыть/архивировать топик {ticket_topic_id}: {e}")
+        log.error(f"Не удалось закрыть/архивировать топик {ticket_topic_id}: {e}", exc_info=True)
         
-    # 5. Очищаем все связанные данные
-    context.bot_data.get('user_ticket_topics', {}).pop(user_id, None)
-    context.bot_data.get('topic_ticket_info', {}).pop(ticket_topic_id, None)
-    context.bot_data.get('dashboard_messages', {}).pop(entry_id, None)
-    log.info(f"Временные данные для тикета #{entry_id} очищены.")
-    
-    # Удаляем кнопки из сообщения
+    # 7. Удаляем кнопки из сообщения
     await query.message.delete()
 
 async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1490,7 +1540,7 @@ async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.bot_data.get("dashboard_topic_id"),
         context.bot_data.get("l1_requests_topic_id"),
         context.bot_data.get("l2_support_topic_id"),
-        context.bot_data.get("l3_billing_topic_id"),
+        context.bot_data.get("l3_support_topic_id"),
     }
     if thread_id in system_topic_ids:
         return # Это системный топик, не для пересылки
@@ -1700,7 +1750,6 @@ async def update_dashboard(application: Application) -> None:
     """Собирает информацию о всех тикетах и обновляет сообщение-дашборд."""
     bot = application.bot
     bot_data = application.bot_data
-
     dashboard_topic_id = bot_data.get("dashboard_topic_id")
     dashboard_message_id = bot_data.get("dashboard_message_id")
     
@@ -1708,7 +1757,6 @@ async def update_dashboard(application: Application) -> None:
         log.warning("ID топика или сообщения дашборда не найдены, обновление пропущено.")
         return
 
-    # 1. Собираем и группируем все активные тикеты
     all_tickets = list(bot_data.get('topic_ticket_info', {}).values())
     
     new_tickets = [t for t in all_tickets if t.get('status') == 'new']
@@ -1723,55 +1771,49 @@ async def update_dashboard(application: Application) -> None:
                 in_progress_tickets[assignee] = []
             in_progress_tickets[assignee].append(ticket)
 
-    # 2. Формируем текст дашборда
-    dashboard_lines = ["📊 <b>Панель управления тикетами</b>\n"]
+    dashboard_lines = ["📊 <b>Панель управления</b>\n"]
     chat_link = f"https://t.me/c/{str(ADMIN_CHAT_ID).replace('-100', '')}"
 
-    # Секция: Новые тикеты
-    dashboard_lines.append("<b>📥 Новые тикеты (L1):</b>")
+    dashboard_lines.append("<b>📥 Новые обращения (L1):</b>")
     if not new_tickets:
-        dashboard_lines.append("  <i>Нет новых тикетов</i>")
+        dashboard_lines.append("  <i>Нет новых обращений</i>")
     else:
         for ticket in sorted(new_tickets, key=lambda x: int(x['entry_id'])):
             ticket_url = f"{chat_link}/{ticket['topic_id']}"
             user_info = f"@{ticket['username']}" if ticket['username'] else ticket['fio']
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Тикет #{ticket['entry_id']}</a> ({html.escape(ticket.get('feedback_type', ''))}) от {html.escape(user_info)}")
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket['entry_id']}</a> ({html.escape(ticket.get('feedback_type', ''))}) от {html.escape(user_info)}")
     dashboard_lines.append("")
 
-    # Секция: Тикеты в работе
-    dashboard_lines.append("<b>⚙️ Тикеты в работе:</b>")
+    dashboard_lines.append("<b>⚙️ В работе:</b>")
     if not in_progress_tickets:
-        dashboard_lines.append("  <i>Нет тикетов в работе</i>")
+        dashboard_lines.append("  <i>Нет обращений в работе</i>")
     else:
         for admin in sorted(in_progress_tickets.keys()):
             dashboard_lines.append(f"  - <b>Оператор: {html.escape(admin)}</b>")
             for ticket in sorted(in_progress_tickets[admin], key=lambda x: int(x['entry_id'])):
                 ticket_url = f"{chat_link}/{ticket['topic_id']}"
-                dashboard_lines.append(f"    - <a href='{ticket_url}'>Тикет #{ticket['entry_id']}</a> ({html.escape(ticket.get('feedback_type', ''))})")
+                dashboard_lines.append(f"    - <a href='{ticket_url}'>Обращение #{ticket['entry_id']}</a> ({html.escape(ticket.get('feedback_type', ''))})")
     dashboard_lines.append("")
     
-    # Секция: L2
     dashboard_lines.append("<b>🛠️ Эскалация (L2):</b>")
     if not l2_tickets:
-        dashboard_lines.append("  <i>Нет тикетов</i>")
+        dashboard_lines.append("  <i>Нет обращений</i>")
     else:
         for ticket in sorted(l2_tickets, key=lambda x: int(x['entry_id'])):
             ticket_url = f"{chat_link}/{ticket['topic_id']}"
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Тикет #{ticket['entry_id']}</a>")
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket['entry_id']}</a>")
     dashboard_lines.append("")
     
-    # Секция: L3
     dashboard_lines.append("<b>💰 Эскалация (L3):</b>")
     if not l3_tickets:
-        dashboard_lines.append("  <i>Нет тикетов</i>")
+        dashboard_lines.append("  <i>Нет обращений</i>")
     else:
         for ticket in sorted(l3_tickets, key=lambda x: int(x['entry_id'])):
             ticket_url = f"{chat_link}/{ticket['topic_id']}"
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Тикет #{ticket['entry_id']}</a>")
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket['entry_id']}</a>")
     
     dashboard_text = "\n".join(dashboard_lines)
 
-    # 3. Обновляем сообщение
     try:
         await bot.edit_message_text(
             text=dashboard_text,
@@ -1780,6 +1822,12 @@ async def update_dashboard(application: Application) -> None:
             parse_mode='HTML',
             disable_web_page_preview=True
         )
+    except telegram.error.BadRequest as e:
+        if "Message is not modified" in str(e):
+            # Игнорируем ошибку, если сообщение не изменилось
+            pass
+        else:
+            log.error(f"Не удалось обновить дашборд: {e}", exc_info=True)
     except Exception as e:
         log.error(f"Не удалось обновить дашборд: {e}", exc_info=True)
 
@@ -1877,7 +1925,6 @@ async def main() -> None:
     application.add_handler(CommandHandler("delete_me", delete_me))
     application.add_handler(CommandHandler("recreate_topics", recreate_topics))
     application.add_handler(CallbackQueryHandler(take_ticket, pattern="^take_ticket_"))
-    application.add_handler(CallbackQueryHandler(take_escalated_ticket, pattern="^take_escalated_"))
     application.add_handler(CallbackQueryHandler(transfer_to_line, pattern="^transfer_l[23]_"))
     application.add_handler(CallbackQueryHandler(set_priority, pattern="^priority_"))
     application.add_handler(CallbackQueryHandler(close_ticket, pattern="^close_ticket_"))

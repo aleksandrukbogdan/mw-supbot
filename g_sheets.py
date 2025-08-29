@@ -5,11 +5,17 @@ import os
 import logging
 import asyncio
 from logger import logger
+
 log = logger.get_logger('g_sheets')
+
 # Определяем абсолютный путь к директории, где находится этот скрипт
 script_dir = os.path.dirname(os.path.abspath(__file__))
 # Составляем полный путь к файлу credentials.json
 credentials_path = os.path.join(script_dir, "credentials.json")
+
+# Глобальный кэш для объекта рабочего листа и лок для асинхронного доступа
+_worksheet_cache = None
+_worksheet_lock = asyncio.Lock()
 
 # Словарь с часами на решение по каждому уровню приоритета.
 # Вы можете изменить эти значения при необходимости.
@@ -20,8 +26,8 @@ SLA_HOURS = {
     'Низкий': 168 
 }
 
-def _get_worksheet_sync():
-    """Синхронная функция для подключения к Google Sheets."""
+def _connect_and_get_worksheet_sync():
+    """Синхронная функция для подключения к Google Sheets. Вызывается только при необходимости."""
     log.info("Попытка подключения к Google Sheets")
     try:
         scopes = [
@@ -61,7 +67,7 @@ def _get_worksheet_sync():
         if len(current_headers) < len(headers):
             worksheet.update('A1', [headers])
             log.info("Заголовки таблицы успешно обновлены")
-        log.info("Подключение к Google Sheets прошло успешно")
+        
         return worksheet
 
     except Exception as e:
@@ -70,16 +76,28 @@ def _get_worksheet_sync():
         return None
 
 async def get_worksheet():
-    """Асинхронно подключается к Google Sheets и возвращает рабочий лист."""
-    return await asyncio.to_thread(_get_worksheet_sync)
+    """
+    Асинхронно получает объект рабочего листа, используя кэширование.
+    Инициализирует соединение при первом вызове.
+    """
+    global _worksheet_cache
+    if _worksheet_cache is not None:
+        return _worksheet_cache
 
-def _add_feedback_sync(user_id, feedback_type, fio, username, platform, message, photo_id):
+    async with _worksheet_lock:
+        # Повторная проверка внутри лока на случай, если другой поток уже инициализировал
+        if _worksheet_cache is not None:
+            return _worksheet_cache
+        
+        worksheet = await asyncio.to_thread(_connect_and_get_worksheet_sync)
+        if worksheet:
+            _worksheet_cache = worksheet
+        return worksheet
+
+
+def _add_feedback_sync(worksheet, user_id, feedback_type, fio, username, platform, message, photo_id):
     log.info(f"Добавление обращения в Google Sheets для user_id={user_id}, type={feedback_type}")
     try:
-        worksheet = _get_worksheet_sync()
-        if not worksheet:
-            log.error("Не удалось получить доступ к рабочему листу")
-            return None
         current_time = datetime.now().strftime("%H:%M:%S %d.%m.%Y")
         new_row = ["", "Зарегистрировано", "", str(user_id), feedback_type, fio, username or "", platform, message, photo_id, current_time]
         new_row.extend([""] * 11)
@@ -105,7 +123,11 @@ def _add_feedback_sync(user_id, feedback_type, fio, username, platform, message,
 
 async def add_feedback(user_id, feedback_type, fio, username, platform, message, photo_id):
     """Асинхронно добавляет новую запись в Google Sheet и возвращает ее номер."""
-    return await asyncio.to_thread(_add_feedback_sync, user_id, feedback_type, fio, username, platform, message, photo_id)
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для добавления отзыва")
+        return None
+    return await asyncio.to_thread(_add_feedback_sync, worksheet, user_id, feedback_type, fio, username, platform, message, photo_id)
 
 def format_delta(delta):
     """Форматирует timedelta в строку ЧЧ:ММ:СС."""
@@ -114,13 +136,9 @@ def format_delta(delta):
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
-def _set_priority_and_sla_sync(entry_id, priority):
+def _set_priority_and_sla_sync(worksheet, entry_id, priority):
     log.info(f"Установление приоритета {priority} и SLA для обращения #{entry_id}")
     try:
-        worksheet = _get_worksheet_sync()
-        if not worksheet:
-            return
-
         row_number = int(entry_id) + 1
         
         COL_PRIORITY = 2
@@ -149,16 +167,15 @@ def _set_priority_and_sla_sync(entry_id, priority):
 
 async def set_priority_and_sla(entry_id, priority):
     """Асинхронно записывает приоритет и рассчитывает SLA."""
-    await asyncio.to_thread(_set_priority_and_sla_sync, entry_id, priority)
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для установки приоритета")
+        return
+    await asyncio.to_thread(_set_priority_and_sla_sync, worksheet, entry_id, priority)
 
-def _get_open_tickets_for_sla_check_sync():
+def _get_open_tickets_for_sla_check_sync(worksheet):
     log.info("Поиск открытых обращений для проверки sla")
     try:
-        worksheet = _get_worksheet_sync()
-        if not worksheet:
-            log.error("Не удалось получить доступ к рабочему листу")
-            return []
-        
         all_records = worksheet.get_all_records()
         log.info(f"Получено {len(all_records)} записей для проверки соответствия sla")
 
@@ -182,15 +199,14 @@ def _get_open_tickets_for_sla_check_sync():
 
 async def get_open_tickets_for_sla_check():
     """Асинхронно возвращает все строки, где статус не 'Завершено', SLA установлено, приоритет 'Критичный' и уведомление ещё не отправлено."""
-    return await asyncio.to_thread(_get_open_tickets_for_sla_check_sync)
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для проверки SLA")
+        return []
+    return await asyncio.to_thread(_get_open_tickets_for_sla_check_sync, worksheet)
 
-def _mark_sla_notification_sent_sync(entry_id):
+def _mark_sla_notification_sent_sync(worksheet, entry_id):
     try:
-        worksheet = _get_worksheet_sync()
-        if not worksheet:
-            log.error("Не удалось получить доступ к рабочему листу")
-            return
-        
         row_number = int(entry_id) + 1
         col_index = 22 
         worksheet.update_cell(row_number, col_index, "Да")
@@ -200,15 +216,14 @@ def _mark_sla_notification_sent_sync(entry_id):
 
 async def mark_sla_notification_sent(entry_id):
     """Асинхронно отмечает, что уведомление по SLA было отправлено."""
-    await asyncio.to_thread(_mark_sla_notification_sent_sync, entry_id)
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для отметки SLA-уведомления")
+        return
+    await asyncio.to_thread(_mark_sla_notification_sent_sync, worksheet, entry_id)
 
-def _record_action_sync(entry_id, action, action_time, status=None):
+def _record_action_sync(worksheet, entry_id, action, action_time, status=None):
     try:
-        worksheet = _get_worksheet_sync()
-        if not worksheet:
-            log.error("Не удалось получить доступ к рабочему листу")
-            return
-
         row_number = int(entry_id) + 1
         try:
             row_values = worksheet.row_values(row_number)
@@ -308,4 +323,8 @@ def _record_action_sync(entry_id, action, action_time, status=None):
 
 async def record_action(entry_id, action, action_time, status=None):
     """Асинхронно записывает действие, его время и вычисляет длительность этапов."""
-    await asyncio.to_thread(_record_action_sync, entry_id, action, action_time, status)
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для записи действия")
+        return
+    await asyncio.to_thread(_record_action_sync, worksheet, entry_id, action, action_time, status)
