@@ -914,37 +914,45 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     return ConversationHandler.END
 
+# Глобальный кеш для имен файлов инструкций
+instruction_files_cache = []
+
+def load_instruction_files():
+    """Загружает и кеширует имена файлов из папки 'instructions'."""
+    global instruction_files_cache
+    instructions_dir = "instructions"
+    try:
+        files = [f for f in os.listdir(instructions_dir) if os.path.isfile(os.path.join(instructions_dir, f))]
+        instruction_files_cache = sorted(files) # Сортируем для постоянства порядка
+        log.info(f"Загружено и кешировано {len(instruction_files_cache)} файлов инструкций.")
+    except FileNotFoundError:
+        log.error(f"Папка с инструкциями '{instructions_dir}' не найдена при запуске.")
+        instruction_files_cache = []
+    except Exception as e:
+        log.error(f"Произошла ошибка при загрузке файлов инструкций: {e}", exc_info=True)
+        instruction_files_cache = []
+
 async def show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показывает список инструкций из папки instructions."""
+    """Показывает список инструкций из кеша."""
     query = update.callback_query
     await query.answer()
     
-    instructions_dir = "instructions"
-    try:
-        # Получаем список файлов и отсеиваем директории
-        files = [f for f in os.listdir(instructions_dir) if os.path.isfile(os.path.join(instructions_dir, f))]
-    except FileNotFoundError:
+    if not instruction_files_cache:
         logger.set_context(update)
-        log.error(f"Папка с инструкциями '{instructions_dir}' не найдена.")
-        await query.edit_message_text("К сожалению, папка с инструкциями не найдена.")
-        return ConversationHandler.END
-
-    if not files:
-        logger.set_context(update)
-        log.warning("Папка с инструкциями пуста.")
+        log.warning("Кеш инструкций пуст.")
         await query.edit_message_text("К сожалению, в данный момент инструкции отсутствуют.")
         return ConversationHandler.END
 
-    # Сохраняем список файлов в user_data для последующего использования
-    context.user_data['instruction_files'] = files
+    # Сохраняем кешированный список файлов в user_data для последующего использования
+    context.user_data['instruction_files'] = instruction_files_cache
 
     keyboard = []
-    for i, filename in enumerate(files):
+    for i, filename in enumerate(instruction_files_cache):
         # Убираем расширение и обрезаем для отображения на кнопке
         button_text = os.path.splitext(filename)[0]
         if len(button_text.encode('utf-8')) > 60: # Обрезаем для красивого отображения
              button_text = button_text[:25] + "..."
-        # Используем индекс файла в callback_data, чтобы избежать превышения лимита
+        # Используем индекс файла в callback_data
         keyboard.append([InlineKeyboardButton(button_text, callback_data=f"instruction_{i}")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -2107,6 +2115,9 @@ async def main() -> None:
     
     # Запускаем фоновую проверку SLA
     application.job_queue.run_repeating(check_sla_breaches, interval=900, first=10)
+
+    # Загружаем инструкции в кеш при старте
+    load_instruction_files()
 
     # Запускаем бота до принудительной остановки
     log.info("Бот готов к работе...")
