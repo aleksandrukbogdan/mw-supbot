@@ -4,7 +4,7 @@ import sys
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, ReplyKeyboardMarkup, InputMediaPhoto, InputMediaDocument, BotCommand, BotCommandScopeChat
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, ReplyKeyboardMarkup, InputMediaPhoto, InputMediaDocument, BotCommand, BotCommandScopeChat, BotCommandScopeChatAdministrators
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +24,7 @@ from database import (
 )
 from logger import logger
 import telegram.error
+import re
 
 # Логируем версию Python при старте
 log = logger.get_logger('main')
@@ -56,11 +57,11 @@ TOPIC_NAMES = {
 
 # Состояния для ConversationHandler
 # Основной диалог
-CHOOSING, PLATFORM, FEEDBACK, AWAITING_PHOTO = range(4)
+CHOOSING, PLATFORM, FEEDBACK, AWAITING_PHOTO, AWAITING_INSTRUCTION = range(5)
 # Состояние для регистрации
-REG_AWAITING_FIO = range(4, 5)
+REG_AWAITING_FIO = range(5, 6)
 # Диалог рассылки
-CHOOSING_DIGEST_CONTENT, AWAITING_DIGEST_TEXT, AWAITING_DIGEST_DOCUMENT, CONFIRM_DIGEST = range(5, 9)
+CHOOSING_DIGEST_CONTENT, AWAITING_DIGEST_TEXT, AWAITING_DIGEST_DOCUMENT, CONFIRM_DIGEST = range(6, 10)
 # Клавиатура для постоянного меню
 persistent_keyboard = [["📝 Создать новое обращение"]]
 persistent_markup = ReplyKeyboardMarkup(persistent_keyboard, resize_keyboard=True)
@@ -71,6 +72,7 @@ reply_keyboard = [
     [InlineKeyboardButton("💡 Отправить предложение", callback_data="feature")],
     [InlineKeyboardButton("🚧 Проблема с доступом", callback_data="access_issue")],
     [InlineKeyboardButton("📞 Получить консультацию", callback_data="consultation")],
+    [InlineKeyboardButton("📄 Получить инструкции", callback_data="get_instructions")],
 ]
 markup = InlineKeyboardMarkup(reply_keyboard)
 
@@ -209,6 +211,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         user_choice_text = "Проблема с доступом"
     elif choice == 'consultation':
         user_choice_text = "Консультация"
+    elif choice == 'get_instructions':
+        user_choice_text = "Получить инструкции"
     else:
         user_choice_text = "Обращение"
     context.user_data["choice"] = user_choice_text
@@ -241,6 +245,8 @@ async def handle_platform_selection(update: Update, context: ContextTypes.DEFAUL
         feedback_type_text = "опишите проблему (например, 'не могу зайти', 'страницы загружаются очень медленно')"
     elif choice == "Консультация":
         feedback_type_text = "опишите, по какому вопросу вам нужна консультация"
+    elif choice == "Получить инструкции":
+        feedback_type_text = "получить инструкции"
     else:
         feedback_type_text = "опишите ваш вопрос"
 
@@ -620,12 +626,27 @@ async def take_escalated_ticket(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("Не удалось найти информацию о тикете. Возможно, он был удален.", show_alert=True)
         return
 
-    # Удаляем сообщение из L2/L3
-    try:
-        await query.message.delete()
-        log.info(f"Сообщение об эскалированном тикете #{entry_id} удалено.")
-    except Exception as e:
-        log.warning(f"Не удалось удалить сообщение об эскалации для тикета #{entry_id}: {e}")
+    # Удаляем ВСЕ сообщения об эскалации для этого тикета из L2 и L3
+    l2_l3_messages_list = context.bot_data.get('l2_l3_messages', {}).pop(entry_id, [])
+    if l2_l3_messages_list:
+        log.info(f"Найдено {len(l2_l3_messages_list)} сообщений об эскалации для тикета #{entry_id}. Удаление...")
+        for message_info in l2_l3_messages_list:
+            try:
+                await context.bot.delete_message(
+                    chat_id=ADMIN_CHAT_ID, 
+                    message_id=message_info['message_id']
+                )
+                log.info(f"Сообщение {message_info['message_id']} для тикета #{entry_id} удалено.")
+            except Exception as e:
+                # Ошибки удаления (например, сообщение уже удалено) не критичны
+                log.warning(f"Не удалось удалить сообщение {message_info['message_id']} для тикета #{entry_id}: {e}")
+    else:
+        # Если в памяти нет сообщений, все равно пробуем удалить текущее
+        log.warning(f"В bot_data не найдено сообщений для тикета #{entry_id}. Попытка удалить текущее сообщение.")
+        try:
+            await query.message.delete()
+        except Exception as e:
+            log.warning(f"Не удалось удалить текущее сообщение для тикета #{entry_id}: {e}")
 
     # Переименовываем топик
     try:
@@ -694,6 +715,17 @@ async def transfer_to_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     log.info(f"Администратор {admin_identifier} эскалирует тикет #{entry_id} на линию {line_number}")
 
+    # --- Новая логика: Очистка старых уведомлений ---
+    # Перед созданием нового уведомления, удаляем все предыдущие для этого тикета
+    l2_l3_messages_list = context.bot_data.get('l2_l3_messages', {}).pop(entry_id, [])
+    if l2_l3_messages_list:
+        log.info(f"Найдено {len(l2_l3_messages_list)} старых сообщений об эскалации для тикета #{entry_id}. Удаление...")
+        for message_info in l2_l3_messages_list:
+            try:
+                await context.bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=message_info['message_id'])
+            except Exception as e:
+                log.warning(f"Не удалось удалить старое сообщение {message_info['message_id']} для тикета #{entry_id}: {e}")
+
     # Обновляем статус тикета
     ticket_info = context.bot_data.get('topic_ticket_info', {}).get(ticket_topic_id)
     if ticket_info:
@@ -731,7 +763,7 @@ async def transfer_to_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 disable_web_page_preview=True
             )
             
-            # Сохраняем ID сообщения для последующего удаления
+            # Сохраняем ID нового сообщения для последующего удаления
             messages_for_ticket = context.bot_data.setdefault('l2_l3_messages', {}).setdefault(entry_id, [])
             messages_for_ticket.append({
                 'message_id': escalation_message.message_id,
@@ -770,18 +802,6 @@ async def transfer_to_line(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         text=query.message.text + f"\n\n---\n➡️Тикет эскалирован на L{line_number} администратором {admin_identifier}.",
         reply_markup=query.message.reply_markup # Сохраняем исходные кнопки
     )
-
-    l2_l3_messages_list = context.bot_data.get('l2_l3_messages', {}).pop(entry_id, [])
-    if l2_l3_messages_list:
-        for message_info in l2_l3_messages_list:
-            try:
-                await context.bot.delete_message(
-                    chat_id=ADMIN_CHAT_ID, 
-                    message_id=message_info['message_id']
-                )
-                log.info(f"Уведомление для тикета #{entry_id} удалено из L2/L3.")
-            except Exception as e:
-                log.warning(f"Не удалось удалить уведомление из L2/L3 для тикета #{entry_id}: {e}")
 
 async def set_priority(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обрабатывает нажатие кнопок приоритета, что равносильно взятию тикета в работу."""
@@ -892,6 +912,104 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     log.info("Отмена текущего диалога")
     await update.message.reply_text("Действие отменено.")
     context.user_data.clear()
+    return ConversationHandler.END
+
+async def show_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показывает список инструкций из папки instructions."""
+    query = update.callback_query
+    await query.answer()
+    
+    instructions_dir = "instructions"
+    try:
+        # Получаем список файлов и отсеиваем директории
+        files = [f for f in os.listdir(instructions_dir) if os.path.isfile(os.path.join(instructions_dir, f))]
+    except FileNotFoundError:
+        logger.set_context(update)
+        log.error(f"Папка с инструкциями '{instructions_dir}' не найдена.")
+        await query.edit_message_text("К сожалению, папка с инструкциями не найдена.")
+        return ConversationHandler.END
+
+    if not files:
+        logger.set_context(update)
+        log.warning("Папка с инструкциями пуста.")
+        await query.edit_message_text("К сожалению, в данный момент инструкции отсутствуют.")
+        return ConversationHandler.END
+
+    # Сохраняем список файлов в user_data для последующего использования
+    context.user_data['instruction_files'] = files
+
+    keyboard = []
+    for i, filename in enumerate(files):
+        # Убираем расширение и обрезаем для отображения на кнопке
+        button_text = os.path.splitext(filename)[0]
+        if len(button_text.encode('utf-8')) > 60: # Обрезаем для красивого отображения
+             button_text = button_text[:25] + "..."
+        # Используем индекс файла в callback_data, чтобы избежать превышения лимита
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"instruction_{i}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text(
+        "Выберите инструкцию для получения:",
+        reply_markup=reply_markup
+    )
+    
+    return AWAITING_INSTRUCTION
+
+async def send_instruction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Отправляет выбранный файл с инструкцией по его индексу."""
+    query = update.callback_query
+    await query.answer()
+    
+    file_path = "" # Инициализация для логгирования в случае ошибки
+    try:
+        # Извлекаем индекс файла из callback_data
+        file_index = int(query.data.replace("instruction_", ""))
+        
+        # Получаем список файлов из user_data
+        instruction_files = context.user_data.get('instruction_files')
+        
+        if not instruction_files or file_index >= len(instruction_files):
+            log.error(f"Неверный индекс инструкции ({file_index}) или список файлов пуст для пользователя {query.from_user.id}.")
+            await query.edit_message_text("❌ Ошибка: не удалось найти информацию о файле. Пожалуйста, начните заново.")
+            return ConversationHandler.END
+            
+        filename = instruction_files[file_index]
+        file_path = os.path.join("instructions", filename)
+        
+        logger.set_context(update)
+        log.info(f"Пользователь {query.from_user.id} запросил инструкцию: {filename}")
+        
+        await query.edit_message_text(f"Подготовка файла '{os.path.splitext(filename)[0]}'...")
+        
+        with open(file_path, 'rb') as document:
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=document,
+                filename=filename
+            )
+        await query.delete_message()
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="✅ Инструкция отправлена. Вы можете создать новое обращение с помощью кнопки ниже.",
+            reply_markup=persistent_markup
+        )
+
+    except FileNotFoundError:
+        log.error(f"Файл инструкции не найден: {file_path}")
+        await query.edit_message_text("❌ Ошибка: файл не найден. Возможно, он был удален.")
+    except (ValueError, IndexError):
+        log.error(f"Ошибка при обработке callback_data для инструкции: {query.data}")
+        await query.edit_message_text("❌ Произошла внутренняя ошибка.")
+    except Exception as e:
+        log.error(f"Ошибка при отправке инструкции {file_path}: {e}", exc_info=True)
+        await query.edit_message_text("❌ Произошла непредвиденная ошибка при отправке файла.")
+    finally:
+        # Очищаем временные данные в любом случае
+        if 'instruction_files' in context.user_data:
+            del context.user_data['instruction_files']
+        
+    # Завершаем диалог
     return ConversationHandler.END
 
 # Создание рассылки дайджеста
@@ -1483,7 +1601,8 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"✅ Ваше обращение №{entry_id} было закрыто. Если у вас возникнут новые вопросы, пожалуйста, создайте новое обращение."
+            text=f"✅ Ваше обращение №{entry_id} было закрыто. Если у вас возникнут новые вопросы, пожалуйста, создайте новое обращение.",
+            reply_markup=persistent_markup
         )
         log.info(f"Уведомление о закрытии отправлено пользователю {user_id}.")
     except Exception as e:
@@ -1725,21 +1844,37 @@ async def post_init_setup(application: Application) -> None:
         BotCommand("new_ticket", "Создать новое обращение"),
         BotCommand("delete_me", "Удалить мои данные"),
     ]
+    # Устанавливаем команды по умолчанию для всех личных чатов
     await application.bot.set_my_commands(user_commands)
 
-    admin_commands = user_commands + [
+    admin_only_commands = [
         BotCommand("start_digest", "Создать рассылку"),
         BotCommand("get_photo", "Получить фото по ID"),
         BotCommand("recreate_topics", "Пересоздать системные топики"),
     ]
     
+    # Устанавливаем полный набор команд для администраторов в их личных чатах с ботом
     if ADMIN_USER_IDS:
         for admin_id in ADMIN_USER_IDS:
             try:
-                await application.bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(admin_id))
+                await application.bot.set_my_commands(user_commands + admin_only_commands, scope=BotCommandScopeChat(admin_id))
             except Exception as e:
                 logger.set_context()
-                log.warning(f"Не удалось установить команды для админа {admin_id}: {e}")
+                log.warning(f"Не удалось установить команды для админа {admin_id} в личном чате: {e}")
+    
+    # Устанавливаем админские команды для администраторов в админском чате
+    if ADMIN_CHAT_ID:
+        try:
+            await application.bot.set_my_commands(
+                admin_only_commands, 
+                scope=BotCommandScopeChatAdministrators(chat_id=ADMIN_CHAT_ID)
+            )
+            log.info(f"Админские команды установлены для чата администраторов: {ADMIN_CHAT_ID}")
+        except Exception as e:
+            log.warning(f"Не удалось установить админские команды для чата {ADMIN_CHAT_ID}: {e}")
+
+    # Загружаем ID топиков из БД один раз при старте
+    application.bot_data.update(await get_all_topic_ids())
 
     # Настройка обязательных топиков в группе админов
     await setup_admin_group_topics(application)
@@ -1753,9 +1888,35 @@ async def update_dashboard(application: Application) -> None:
     dashboard_topic_id = bot_data.get("dashboard_topic_id")
     dashboard_message_id = bot_data.get("dashboard_message_id")
     
-    if not dashboard_topic_id or not dashboard_message_id or not ADMIN_CHAT_ID:
-        log.warning("ID топика или сообщения дашборда не найдены, обновление пропущено.")
+    if not dashboard_topic_id or not ADMIN_CHAT_ID:
+        log.warning("ID топика дашборда не найден, обновление пропущено.")
         return
+    
+    # Если нет ID сообщения, пытаемся найти его или создать новое
+    if not dashboard_message_id:
+        log.warning("ID сообщения дашборда не найдено. Попытка найти или создать новое...")
+        try:
+            # Пытаемся найти закрепленное сообщение
+            chat_info = await bot.get_chat(ADMIN_CHAT_ID)
+            if chat_info.pinned_message and chat_info.pinned_message.is_topic_message and chat_info.pinned_message.message_thread_id == dashboard_topic_id:
+                dashboard_message_id = chat_info.pinned_message.message_id
+                application.bot_data['dashboard_message_id'] = dashboard_message_id
+                log.info(f"Найдено существующее закрепленное сообщение дашборда: {dashboard_message_id}")
+            else: # Если не нашли, создаем новое
+                log.info("Закрепленное сообщение не найдено, создаем новое...")
+                new_message = await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_thread_id=dashboard_topic_id,
+                    text="📊 <b>Панель управления</b>\n\n<i>Загрузка данных...</i>",
+                    parse_mode='HTML'
+                )
+                dashboard_message_id = new_message.message_id
+                application.bot_data['dashboard_message_id'] = dashboard_message_id
+                await bot.pin_chat_message(chat_id=ADMIN_CHAT_ID, message_id=dashboard_message_id)
+                log.info(f"Создано и закреплено новое сообщение для дашборда: {dashboard_message_id}")
+        except Exception as e:
+            log.error(f"Не удалось найти или создать сообщение для дашборда: {e}")
+            return # Прерываем выполнение, если не можем обеспечить наличие сообщения
 
     all_tickets = list(bot_data.get('topic_ticket_info', {}).values())
     
@@ -1879,6 +2040,7 @@ async def main() -> None:
         states={
             CHOOSING: [
                 CallbackQueryHandler(button, pattern="^(bug|feature|access_issue|consultation)$"),
+                CallbackQueryHandler(show_instructions, pattern="^get_instructions$"),
             ],
             PLATFORM: [
                 CallbackQueryHandler(handle_platform_selection, pattern="^platform_")
@@ -1888,6 +2050,9 @@ async def main() -> None:
                 MessageHandler(filters.PHOTO, handle_photo),
                 CallbackQueryHandler(skip_photo_and_save, pattern="^skip_photo$"),
                 CallbackQueryHandler(finish_photos_and_save, pattern="^finish_photos$")
+            ],
+            AWAITING_INSTRUCTION: [
+                CallbackQueryHandler(send_instruction, pattern="^instruction_")
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -1925,6 +2090,7 @@ async def main() -> None:
     application.add_handler(CommandHandler("delete_me", delete_me))
     application.add_handler(CommandHandler("recreate_topics", recreate_topics))
     application.add_handler(CallbackQueryHandler(take_ticket, pattern="^take_ticket_"))
+    application.add_handler(CallbackQueryHandler(take_escalated_ticket, pattern="^take_escalated_"))
     application.add_handler(CallbackQueryHandler(transfer_to_line, pattern="^transfer_l[23]_"))
     application.add_handler(CallbackQueryHandler(set_priority, pattern="^priority_"))
     application.add_handler(CallbackQueryHandler(close_ticket, pattern="^close_ticket_"))
@@ -1986,6 +2152,166 @@ async def recreate_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         log.error(f"Ошибка при пересоздании топиков: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Произошла ошибка: {e}")
+
+async def take_escalated_ticket_from_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket_info: dict) -> None:
+    """
+    Выполняет логику взятия эскалированного тикета в работу.
+    Эта функция вызывается из handle_admin_reply, когда админ отвечает на уведомление.
+    """
+    admin_user = update.message.from_user
+    admin_identifier = f"@{admin_user.username}" if admin_user.username else admin_user.full_name
+    entry_id = ticket_info['entry_id']
+    ticket_topic_id = ticket_info['topic_id']
+    user_id = ticket_info['user_id']
+
+    log.info(f"Администратор {admin_identifier} берет в работу эскалированный тикет #{entry_id} через ответ в топике.")
+
+    # Проверяем, не взят ли уже
+    if ticket_info.get('status') != 'in_progress':
+        # 1. Обновляем статус тикета в bot_data
+        ticket_info['status'] = 'in_progress'
+        ticket_info['assignee'] = admin_identifier
+
+        # 2. Удаляем ВСЕ сообщения об эскалации для этого тикета из L2 и L3
+        l2_l3_messages_list = context.bot_data.get('l2_l3_messages', {}).pop(entry_id, [])
+        if l2_l3_messages_list:
+            log.info(f"Найдено {len(l2_l3_messages_list)} сообщений об эскалации для тикета #{entry_id}. Удаление...")
+            for message_info in l2_l3_messages_list:
+                try:
+                    await context.bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=message_info['message_id'])
+                except Exception as e:
+                    log.warning(f"Не удалось удалить сообщение {message_info['message_id']} для тикета #{entry_id}: {e}")
+        
+        # 3. Переименовываем топик
+        try:
+            username = ticket_info.get('username', 'user')
+            fio = ticket_info.get('fio', '')
+            new_topic_name = f"Тикет #{entry_id} [В работе - {admin_identifier}] от @{username or fio}"
+            await context.bot.edit_forum_topic(chat_id=ADMIN_CHAT_ID, message_thread_id=ticket_topic_id, name=new_topic_name)
+        except Exception as e:
+            log.error(f"Не удалось переименовать топик для тикета #{entry_id}: {e}")
+
+        # 4. Обновляем Dashboard
+        await update_dashboard(context.application)
+
+        # 5. Integration Point: Обновляем Google Sheets
+        try:
+            current_line = ticket_info['status'].split('_')[-1] # escalated_l2 -> l2
+            line_number = ''.join(filter(str.isdigit, current_line))
+            await record_action(entry_id, f'taken_l{line_number}', datetime.now(), status=f"На {line_number} линии")
+        except Exception as e:
+            log.error(f"Не удалось обновить Google Sheets для тикета #{entry_id}: {e}")
+
+        # 6. Уведомляем пользователя
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚙️ Ваше обращение №{entry_id} было взято в работу оператором ({admin_identifier})."
+            )
+        except Exception as e:
+            log.error(f"Не удалось уведомить пользователя {user_id} о взятии тикета в работу: {e}")
+
+        # 7. Добавляем кнопки управления в топик
+        transfer_keyboard = [
+            InlineKeyboardButton("2️⃣ На 2 линию", callback_data=f"transfer_l2_{entry_id}_{user_id}_{ticket_topic_id}"),
+            InlineKeyboardButton("3️⃣ На 3 линию", callback_data=f"transfer_l3_{entry_id}_{user_id}_{ticket_topic_id}")
+        ]
+        close_keyboard = [
+            InlineKeyboardButton("❌ Закрыть задачу", callback_data=f"close_ticket_{entry_id}_{user_id}_{ticket_topic_id}")
+        ]
+        control_markup = InlineKeyboardMarkup([transfer_keyboard, close_keyboard])
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            message_thread_id=ticket_topic_id,
+            text="Панель управления тикетом:",
+            reply_markup=control_markup
+        )
+    else:
+        log.info(f"Тикет #{entry_id} уже в работе у {ticket_info.get('assignee')}. Ответ просто пересылается.")
+
+    # В любом случае, пересылаем исходное сообщение администратора пользователю
+    try:
+        await context.bot.copy_message(
+            chat_id=user_id,
+            from_chat_id=ADMIN_CHAT_ID,
+            message_id=update.message.message_id
+        )
+        log.info(f"Сообщение от {admin_identifier} отправлено пользователю {user_id} для тикета #{entry_id}")
+    except Exception as e:
+        log.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}", exc_info=True)
+
+
+async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает сообщения администраторов в топиках тикетов и пересылает их пользователям."""
+    logger.set_context(update)
+    message = update.message
+    
+    if not message or not message.is_topic_message or not ADMIN_CHAT_ID or message.chat_id != int(ADMIN_CHAT_ID):
+        return
+
+    thread_id = message.message_thread_id
+    bot_data = context.bot_data
+    
+    # --- Новая логика ---
+    # Проверяем, не является ли сообщение ответом в топике L2 или L3
+    l2_topic_id = bot_data.get("l2_support_topic_id")
+    l3_topic_id = bot_data.get("l3_support_topic_id")
+
+    if thread_id in [l2_topic_id, l3_topic_id] and message.reply_to_message and message.reply_to_message.from_user.is_bot:
+        # Это ответ на сообщение бота в топике L2/L3 - значит, это взятие тикета в работу
+        replied_text = message.reply_to_message.text
+        import re
+        match = re.search(r"Тикет #(\d+)", replied_text)
+        if match:
+            entry_id_to_find = match.group(1)
+            found_ticket = None
+            for topic_id, ticket_data in bot_data.get('topic_ticket_info', {}).items():
+                if ticket_data.get('entry_id') == entry_id_to_find:
+                    found_ticket = ticket_data
+                    break
+            
+            if found_ticket and found_ticket['status'].startswith('escalated'):
+                await take_escalated_ticket_from_reply(update, context, found_ticket)
+                return # Завершаем обработку здесь
+
+    # --- Старая логика для обычных ответов ---
+    # Игнорируем сообщения в системных топиках, КРОМЕ L2/L3 (их обработали выше)
+    system_topic_ids = {
+        bot_data.get("dashboard_topic_id"),
+        bot_data.get("l1_requests_topic_id"),
+        l2_topic_id,
+        l3_topic_id,
+    }
+    if thread_id in system_topic_ids:
+        return # Это системный топик, не для пересылки
+    
+    ticket_info = bot_data.get('topic_ticket_info', {}).get(thread_id)
+    
+    if ticket_info:
+        user_id = ticket_info.get('user_id')
+        entry_id = ticket_info.get('entry_id')
+        
+        if not user_id:
+            log.warning(f"Не найден user_id для топика {thread_id}")
+            return
+
+        try:
+            # Пересылаем сообщение пользователя
+            # Копируем, чтобы выглядело как прямое сообщение от бота, а не форвард
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=ADMIN_CHAT_ID,
+                message_id=message.message_id
+            )
+            log.info(f"Сообщение от администратора отправлено пользователю {user_id} для тикета #{entry_id}")
+            # Можно добавить тихое подтверждение в топик, что сообщение доставлено
+            # await message.reply_text("✅ Отправлено пользователю.", quote=False)
+        except Exception as e:
+            log.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}", exc_info=True)
+            try:
+                await message.reply_text(f"❌ Не удалось доставить сообщение пользователю. Ошибка: {e}", quote=True)
+            except Exception as e_reply:
+                log.error(f"Не удалось даже отправить сообщение об ошибке в чат: {e_reply}")
 
 
 if __name__ == "__main__":
