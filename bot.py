@@ -1859,6 +1859,7 @@ async def post_init_setup(application: Application) -> None:
         BotCommand("start_digest", "Создать рассылку"),
         BotCommand("get_photo", "Получить фото по ID"),
         BotCommand("recreate_topics", "Пересоздать системные топики"),
+        BotCommand("fast_answer", "Быстрый ответ пользователю")
     ]
     
     # Устанавливаем полный набор команд для администраторов в их личных чатах с ботом
@@ -1999,6 +2000,72 @@ async def update_dashboard(application: Application) -> None:
             log.error(f"Не удалось обновить дашборд: {e}", exc_info=True)
     except Exception as e:
         log.error(f"Не удалось обновить дашборд: {e}", exc_info=True)
+# Список быстрых ответов
+ANSWERS = [
+        "Добрый день! Проверьте подключение к интернету",
+        "Добрый день! Проблема решена",
+        "Сами разбирайтесь",
+        "Совсем мозгов чтоли нет?"
+    ]
+
+async def fast_answer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обрабатывает и команду /fast_answer и выбор ответа из клавиатуры"""
+    # Если это команда /fast_answer
+    if update.message and update.message.text == "/fast_answer":
+        log.info(f"Администратор вызывает команду /fast_answer в чате {update.effective_chat.id}")
+        if not update.effective_message.message_thread_id:
+                await update.message.reply_text("❌ Эта команда работает только в топиках форума")
+                return
+        # Создаем клавиатуру
+        keyboard = []
+        for i in range(len(ANSWERS)):
+            keyboard.append([InlineKeyboardButton(ANSWERS[i], callback_data=f"fast_answer_{i}")])
+        
+        await update.message.reply_text(
+            text="Пожалуйста, выберите быстрый ответ:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            message_thread_id=update.effective_message.message_thread_id
+        )
+    # Если это callback от нажатия кнопки
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        # Номер типового ответа из списка
+        answer_index = int(query.data.split('_')[2])
+        selected_answer = ANSWERS[answer_index]
+        
+        log.info(f"Администратор выбрал ответ: {selected_answer}")
+        # Удаляем клавиатуру
+        await query.edit_message_reply_markup(reply_markup=None)
+        # Отправляем выбранный ответ в топик
+        await query.edit_message_text(
+            f"Вы ответили пользователю: {selected_answer}"
+        )
+
+    thread_id = query.message.message_thread_id
+    ticket_info = context.bot_data.get('topic_ticket_info', {}).get(thread_id)
+    if ticket_info:
+        user_id = ticket_info.get('user_id')
+        entry_id = ticket_info.get('entry_id')
+        
+        if not user_id:
+            log.warning(f"Не найден user_id для топика {thread_id}")
+            return
+
+        try:
+            # Пересылаем сообщение пользователя
+            # Копируем, чтобы выглядело как прямое сообщение от бота, а не форвард
+            await context.bot.send_message(
+                chat_id=user_id,
+                text = selected_answer
+            )
+            log.info(f"Сообщение от администратора отправлено пользователю {user_id} для тикета #{entry_id}")
+        except Exception as e:
+            log.error(f"Не удалось отправить сообщение пользователю {user_id}: {e}", exc_info=True)
+            try:
+                await query.message.reply_text(f"❌ Не удалось доставить сообщение пользователю. Ошибка: {e}", quote=True)
+            except Exception as e_reply:
+                log.error(f"Не удалось даже отправить сообщение об ошибке в чат: {e_reply}")
 
 async def main() -> None:
     """Настраивает и запускает бота."""
@@ -2097,6 +2164,8 @@ async def main() -> None:
     application.add_handler(CommandHandler("get_photo", get_photo_by_id))
     application.add_handler(CommandHandler("delete_me", delete_me))
     application.add_handler(CommandHandler("recreate_topics", recreate_topics))
+    application.add_handler(CommandHandler("fast_answer", fast_answer_handler))
+    application.add_handler(CallbackQueryHandler(fast_answer_handler, pattern="^fast_answer_"))
     application.add_handler(CallbackQueryHandler(take_ticket, pattern="^take_ticket_"))
     application.add_handler(CallbackQueryHandler(take_escalated_ticket, pattern="^take_escalated_"))
     application.add_handler(CallbackQueryHandler(transfer_to_line, pattern="^transfer_l[23]_"))
