@@ -14,6 +14,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
     JobQueue,
+    TypeHandler,
+    PicklePersistence,
 )
 import html
 from g_sheets import add_feedback, record_action, set_priority_and_sla, get_open_tickets_for_sla_check, mark_sla_notification_sent
@@ -1846,14 +1848,16 @@ async def setup_admin_group_topics(application: Application) -> None:
 
 async def post_init_setup(application: Application) -> None:
     """Выполняет настройку после инициализации бота (команды, топики)."""
+    log.info("--- Запуск post_init_setup ---")
     # Установка команд для меню
     user_commands = [
         BotCommand("start", "Перезапустить бота / Регистрация"),
         BotCommand("new_ticket", "Создать новое обращение"),
         BotCommand("delete_me", "Удалить мои данные"),
     ]
-    # Устанавливаем команды по умолчанию для всех личных чатов
+    # Устанавливаем команды по умолчанию для всех пользователей
     await application.bot.set_my_commands(user_commands)
+    log.info("Команды по умолчанию для обычных пользователей установлены.")
 
     admin_only_commands = [
         BotCommand("start_digest", "Создать рассылку"),
@@ -1862,33 +1866,32 @@ async def post_init_setup(application: Application) -> None:
         BotCommand("fast_answer", "Быстрый ответ пользователю")
     ]
     
-    # Устанавливаем полный набор команд для администраторов в их личных чатах с ботом
-    if ADMIN_USER_IDS:
-        for admin_id in ADMIN_USER_IDS:
-            try:
-                await application.bot.set_my_commands(user_commands + admin_only_commands, scope=BotCommandScopeChat(admin_id))
-            except Exception as e:
-                logger.set_context()
-                log.warning(f"Не удалось установить команды для админа {admin_id} в личном чате: {e}")
-    
+    ## Устанавливаем полный набор команд для администраторов в их личных чатах с ботом
+    #if ADMIN_USER_IDS:
+    #    log.info(f"Начинаю установку команд для {len(ADMIN_USER_IDS)} админов в личных чатах...")
+    #    for admin_id in ADMIN_USER_IDS:
+    #        try:
+    #            await application.bot.set_my_commands(user_commands + admin_only_commands, scope=BotCommandScopeChat(admin_id))
+    #            log.info(f"Команды для админа {admin_id} в личном чате успешно установлены.")
+    #        except Exception as e:
+    #            logger.set_context()
+    #            log.warning(f"Не удалось установить команды для админа {admin_id} в личном чате: {e}", exc_info=True)
+    #
     # Устанавливаем админские команды для администраторов в админском чате
     if ADMIN_CHAT_ID:
+        log.info(f"Начинаю установку команд для админского чата {ADMIN_CHAT_ID}...")
         try:
             await application.bot.set_my_commands(
                 admin_only_commands, 
-                scope=BotCommandScopeChatAdministrators(chat_id=ADMIN_CHAT_ID)
+                scope=BotCommandScopeChat(chat_id=ADMIN_CHAT_ID)
             )
-            log.info(f"Админские команды установлены для чата администраторов: {ADMIN_CHAT_ID}")
+            log.info(f"Админские команды для чата {ADMIN_CHAT_ID} УСПЕШНО установлены.")
         except Exception as e:
-            log.warning(f"Не удалось установить админские команды для чата {ADMIN_CHAT_ID}: {e}")
+            log.warning(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось установить админские команды для чата {ADMIN_CHAT_ID}: {e}", exc_info=True)
 
     # Загружаем ID топиков из БД один раз при старте
-    application.bot_data.update(await get_all_topic_ids())
-
-    # Настройка обязательных топиков в группе админов
     await setup_admin_group_topics(application)
-    # Первоначальная отрисовка дашборда
-    await update_dashboard(application)
+    log.info("--- Завершение post_init_setup ---")
 
 async def update_dashboard(application: Application) -> None:
     """Собирает информацию о всех тикетах и обновляет сообщение-дашборд."""
@@ -2088,12 +2091,14 @@ async def main() -> None:
     application = (
         Application.builder()
         .token(token)
-        .post_init(post_init_setup)
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
         .build()
     )
+
+    # Вручную вызываем настройку после создания application
+    await post_init_setup(application)
 
     # Отдельный обработчик для регистрации
     registration_handler = ConversationHandler(
