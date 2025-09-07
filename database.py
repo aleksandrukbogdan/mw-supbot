@@ -202,10 +202,13 @@ async def get_all_topic_ids() -> dict:
         return {} 
 
 async def delete_all_topics() -> None:
-    """Удаляет все записи о топиках из базы данных."""
+    """Удаляет таблицу топиков из базы данных, если она существует."""
     conn = await aiosqlite.connect(DB_PATH)
     try:
-        await conn.execute('DELETE FROM topics')
+        await conn.execute('DROP TABLE IF EXISTS topics')
         await conn.commit()
+        log.info("Таблица 'topics' успешно удалена.")
+    except Exception as e:
+        log.error(f"Ошибка при удалении таблицы 'topics': {e}")
     finally:
         await conn.close() 

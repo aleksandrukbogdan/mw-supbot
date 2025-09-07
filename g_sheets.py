@@ -59,7 +59,8 @@ def _connect_and_get_worksheet_sync():
             "Время получения обращения", "Время взятия в работу", 
             "Передача на 2 линию", "Передача на 3 Линию",
             "Время на 1 линии", "Время на 2 линии", "Время на 3 линии",
-            "Время закрытия обращения", "Время решения", "SLA (Время на решение)", "Соответствие SLA", "SLA-уведомление отправлено"
+            "Время закрытия обращения", "Время решения", "SLA (Время на решение)", "Соответствие SLA", "SLA-уведомление отправлено",
+            "Topic ID" # Добавленный столбец
         ]
         
         current_headers = worksheet.row_values(1) if worksheet.get_all_values() else []
@@ -328,3 +329,136 @@ async def record_action(entry_id, action, action_time, status=None):
         log.error("Не удалось получить доступ к рабочему листу для записи действия")
         return
     await asyncio.to_thread(_record_action_sync, worksheet, entry_id, action, action_time, status)
+
+
+def _update_cell_sync(worksheet, entry_id, column_name, value):
+    """Синхронно обновляет одну ячейку в строке по ID обращения."""
+    try:
+        log.info(f"Обновление ячейки для обращения #{entry_id}. Колонка: {column_name}, Значение: {value}")
+        headers = worksheet.row_values(1)
+        if column_name not in headers:
+            log.error(f"Столбец '{column_name}' не найден в таблице.")
+            return False
+        
+        col_index = headers.index(column_name) + 1
+        row_number = int(entry_id) + 1 # +1 потому что нумерация с 1, и +1 из-за заголовков
+
+        worksheet.update_cell(row_number, col_index, str(value))
+        log.info(f"Ячейка для обращения #{entry_id} успешно обновлена.")
+        return True
+    except Exception as e:
+        log.error(f"Ошибка при обновлении ячейки для #{entry_id}: {e}")
+        log.exception("Полный стек ошибки:")
+        return False
+
+async def update_ticket_status(entry_id: str, status: str):
+    """Асинхронно обновляет статус обращения."""
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для обновления статуса.")
+        return
+    await asyncio.to_thread(_update_cell_sync, worksheet, entry_id, "Статус обращения", status)
+    # Дополнительно вызываем record_action для фиксации времени закрытия, если статус "Завершено"
+    if status == "Завершено":
+        await record_action(entry_id, 'closed', datetime.now(), status=status)
+
+
+async def update_ticket_topic_id(entry_id: int, topic_id: int):
+    """Асинхронно обновляет Topic ID для обращения."""
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для обновления Topic ID.")
+        return
+    await asyncio.to_thread(_update_cell_sync, worksheet, entry_id, "Topic ID", topic_id)
+
+
+def _get_all_tickets_sync(worksheet):
+    """Синхронно получает все записи из таблицы."""
+    try:
+        log.info("Запрос всех записей из Google Sheets.")
+        records = worksheet.get_all_records()
+        log.info(f"Найдено {len(records)} записей.")
+        return records
+    except Exception as e:
+        log.error(f"Ошибка при получении всех записей из Google Sheets: {e}")
+        return []
+
+async def get_all_tickets():
+    """Асинхронно получает все записи из таблицы."""
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для получения всех записей.")
+        return []
+    return await asyncio.to_thread(_get_all_tickets_sync, worksheet)
+
+def get_ticket_details_by_id(ticket_id: int) -> dict | None:
+    """Получает детали тикета по его ID."""
+    worksheet = _worksheet_cache
+    if not worksheet:
+        # В идеале, здесь нужно асинхронно получить worksheet,
+        # но для простоты предположим, что он уже кэширован.
+        # В синхронном контексте это единственный вариант.
+        log.error("Worksheet не кэширован для get_ticket_details_by_id")
+        return None
+    try:
+        all_records = _get_all_tickets_sync(worksheet)
+        for record in all_records:
+            if str(record.get('Номер', '')) == str(ticket_id):
+                return {
+                    'user_id': record.get('ID Пользователя'),
+                    'topic_id': record.get('Topic ID'), # Убедитесь, что колонка 'topic_id' существует
+                }
+        log.warning(f"Тикет с ID {ticket_id} не найден в Google Sheets.")
+        return None
+    except Exception as e:
+        log.error(f"Ошибка при получении деталей тикета {ticket_id} из Google Sheets: {e}")
+        return None
+
+def get_ticket_details_by_topic_id(topic_id: int) -> dict | None:
+    """Получает детали тикета по ID топика."""
+    worksheet = _worksheet_cache
+    if not worksheet:
+        log.error("Worksheet не кэширован для get_ticket_details_by_topic_id")
+        return None
+    try:
+        all_records = _get_all_tickets_sync(worksheet)
+        for record in all_records:
+            try:
+                record_topic_id = int(record.get('Topic ID', ''))
+            except (ValueError, TypeError):
+                continue
+
+            if record_topic_id == topic_id:
+                return {
+                    'id': record.get('Номер'),
+                    'user_id': record.get('ID Пользователя'),
+                    'topic_id': record.get('Topic ID'),
+                    'status': record.get('Статус обращения'),
+                }
+        log.warning(f"Тикет с topic_id {topic_id} не найден в Google Sheets.")
+        return None
+    except Exception as e:
+        log.error(f"Ошибка при получении деталей тикета по topic_id {topic_id}: {e}")
+        return None
+
+def get_last_open_ticket_by_user_id(user_id: int) -> dict | None:
+    """Получает последнее открытое обращение пользователя."""
+    worksheet = _worksheet_cache
+    if not worksheet:
+        log.error("Worksheet не кэширован для get_last_open_ticket_by_user_id")
+        return None
+    try:
+        all_records = _get_all_tickets_sync(worksheet)
+        user_tickets = [
+            r for r in all_records 
+            if str(r.get('ID Пользователя')) == str(user_id) and r.get('Статус обращения', '').lower() == 'в работе'
+        ]
+        if not user_tickets:
+            return None
+        
+        user_tickets.sort(key=lambda x: int(x.get('Номер', 0)), reverse=True)
+        return user_tickets[0]
+
+    except Exception as e:
+        log.error(f"Ошибка при поиске последнего открытого тикета для user_id {user_id}: {e}")
+        return None
