@@ -75,6 +75,13 @@ async def initialize_db():
             )
         ''')
 
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        
         await conn.commit()
     finally:
         await conn.close()
@@ -212,3 +219,32 @@ async def delete_all_topics() -> None:
         log.error(f"Ошибка при удалении таблицы 'topics': {e}")
     finally:
         await conn.close() 
+
+async def set_setting(key: str, value: str):
+    """Сохраняет или обновляет значение для указанного ключа в настройках."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            await conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value))  # Убедимся, что значение всегда строка
+            )
+            await conn.commit()
+            log.info(f"Настройка '{key}' сохранена/обновлена: {value}")
+    except aiosqlite.Error as e:
+        log.error(f"Ошибка при сохранении настройки '{key}': {e}")
+
+async def get_setting(key: str) -> str | None:
+    """Возвращает значение для указанного ключа из настроек."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as conn:
+            cursor = await conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            if row:
+                log.info(f"Загружена настройка '{key}': {row[0]}")
+                return row[0]
+            else:
+                log.info(f"Настройка '{key}' не найдена в БД.")
+                return None
+    except aiosqlite.Error as e:
+        log.error(f"Ошибка при загрузке настройки '{key}' из БД: {e}")
+        return None 

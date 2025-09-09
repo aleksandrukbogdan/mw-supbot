@@ -17,6 +17,10 @@ credentials_path = os.path.join(script_dir, "credentials.json")
 _worksheet_cache = None
 _worksheet_lock = asyncio.Lock()
 
+# Глобальный кэш для всех записей таблицы и лок для асинхронного доступа
+_tickets_cache = None
+_cache_lock = asyncio.Lock()
+
 # Словарь с часами на решение по каждому уровню приоритета.
 # Вы можете изменить эти значения при необходимости.
 SLA_HOURS = {
@@ -60,7 +64,8 @@ def _connect_and_get_worksheet_sync():
             "Передача на 2 линию", "Передача на 3 Линию",
             "Время на 1 линии", "Время на 2 линии", "Время на 3 линии",
             "Время закрытия обращения", "Время решения", "SLA (Время на решение)", "Соответствие SLA", "SLA-уведомление отправлено",
-            "Topic ID" # Добавленный столбец
+            "Topic ID",
+            "Ticket URL"  # Новый столбец
         ]
         
         current_headers = worksheet.row_values(1) if worksheet.get_all_values() else []
@@ -361,6 +366,8 @@ async def update_ticket_status(entry_id: str, status: str):
     # Дополнительно вызываем record_action для фиксации времени закрытия, если статус "Завершено"
     if status == "Завершено":
         await record_action(entry_id, 'closed', datetime.now(), status=status)
+    global _tickets_cache
+    _tickets_cache = None
 
 
 async def update_ticket_topic_id(entry_id: int, topic_id: int):
@@ -370,6 +377,8 @@ async def update_ticket_topic_id(entry_id: int, topic_id: int):
         log.error("Не удалось получить доступ к рабочему листу для обновления Topic ID.")
         return
     await asyncio.to_thread(_update_cell_sync, worksheet, entry_id, "Topic ID", topic_id)
+    global _tickets_cache
+    _tickets_cache = None
 
 
 def _get_all_tickets_sync(worksheet):
@@ -389,7 +398,10 @@ async def get_all_tickets():
     if not worksheet:
         log.error("Не удалось получить доступ к рабочему листу для получения всех записей.")
         return []
-    return await asyncio.to_thread(_get_all_tickets_sync, worksheet)
+    async with _cache_lock:
+        if _tickets_cache is None:
+            _tickets_cache = await asyncio.to_thread(_get_all_tickets_sync, worksheet)
+        return _tickets_cache
 
 def get_ticket_details_by_id(ticket_id: int) -> dict | None:
     """Получает детали тикета по его ID."""
@@ -462,3 +474,13 @@ def get_last_open_ticket_by_user_id(user_id: int) -> dict | None:
     except Exception as e:
         log.error(f"Ошибка при поиске последнего открытого тикета для user_id {user_id}: {e}")
         return None
+
+async def update_ticket_url(entry_id: int, url: str):
+    """Асинхронно обновляет Ticket URL для обращения."""
+    worksheet = await get_worksheet()
+    if not worksheet:
+        log.error("Не удалось получить доступ к рабочему листу для обновления Ticket URL.")
+        return
+    await asyncio.to_thread(_update_cell_sync, worksheet, entry_id, "Ticket URL", url)
+    global _tickets_cache
+    _tickets_cache = None
