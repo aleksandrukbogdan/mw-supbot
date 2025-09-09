@@ -35,7 +35,8 @@ from g_sheets import (
 from database import (
     initialize_db, get_all_users, get_user_fio, set_user_fio, 
     get_or_create_user, delete_user, set_user_username, get_user_username,
-    set_topic_id, get_all_topic_ids, delete_all_topics
+    set_topic_id, get_all_topic_ids, delete_all_topics,
+    get_setting, set_setting
 )
 from logger import logger
 import telegram.error
@@ -1692,10 +1693,15 @@ async def close_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Удаляем запись о сообщениях - УДАЛЕНО, т.к. pop уже сделал это
         # del context.bot_data['l2_l3_messages'][entry_id]
 
-    # 4. Обновляем Dashboard
+    # 4. Удаляем информацию о самом тикете из кэша bot_data
+    if ticket_topic_id:
+        context.bot_data.get('topic_ticket_info', {}).pop(ticket_topic_id, None)
+        log.info(f"Информация о тикете #{entry_id} (топик {ticket_topic_id}) удалена из кэша bot_data.")
+
+    # 5. Обновляем Dashboard
     await update_dashboard(context.application)
 
-    # 5. Integration Point: Обновляем Google Sheets
+    # 6. Integration Point: Обновляем Google Sheets
     try:
         await record_action(entry_id, 'closed', datetime.now(), status="Завершено")
         log.info(f"Статус тикета #{entry_id} обновлен в Google Sheets на 'Завершено'.")
@@ -1970,6 +1976,13 @@ async def setup_admin_group_topics(application: Application) -> None:
     # Загружаем существующие ID из БД
     existing_topics = await get_all_topic_ids()
     application.bot_data.update(existing_topics)
+    dashboard_message_id = await get_setting("dashboard_message_id")
+    if dashboard_message_id:
+        try:
+            application.bot_data["dashboard_message_id"] = int(dashboard_message_id)
+        except (ValueError, TypeError):
+            log.warning(f"Не удалось преобразовать dashboard_message_id '{dashboard_message_id}' в число.")
+
     log.info(f"Загружены ID топиков из БД: {existing_topics}")
 
     missing_topics = False
@@ -1993,13 +2006,16 @@ async def setup_admin_group_topics(application: Application) -> None:
                         message_thread_id=thread_id,
                         text="📊 Панель управления тикетами. Новые обращения будут появляться здесь."
                     )
+                    # Сохраняем ID и в bot_data, и в постоянное хранилище
                     application.bot_data['dashboard_message_id'] = message_to_pin.message_id
+                    await set_setting("dashboard_message_id", str(message_to_pin.message_id))
+
                     await bot.pin_chat_message(
                         chat_id=ADMIN_CHAT_ID,
                         message_id=message_to_pin.message_id,
                         disable_notification=True
                     )
-                    log.info(f"Сообщение в топике Dashboard создано (ID: {message_to_pin.message_id}) и закреплено.")
+                    log.info(f"Сообщение в топике Dashboard создано (ID: {message_to_pin.message_id}), закреплено и сохранено в БД.")
                     
             except Exception as e:
                 # Вложенный try-except для обработки ошибок создания одного топика
@@ -2007,6 +2023,52 @@ async def setup_admin_group_topics(application: Application) -> None:
 
     if not missing_topics:
         log.info("Все системные топики уже существуют и загружены.")
+
+async def cleanup_closed_tickets_from_bot_data(application: Application) -> None:
+    """
+    Очищает bot_data, удаляя записи о тикетах, которые уже закрыты в Google Sheets.
+    Полезно запускать при старте, чтобы предотвратить разрастание памяти из-за данных предыдущих сессий.
+    """
+    log.info("Запуск очистки закрытых тикетов из bot_data...")
+    bot_data = application.bot_data
+
+    if 'topic_ticket_info' not in bot_data or not bot_data['topic_ticket_info']:
+        log.info("В bot_data нет информации о тикетах, очистка не требуется.")
+        return
+
+    try:
+        # Используем get_all_tickets для получения свежих данных из таблицы
+        all_sheet_tickets = await get_all_tickets()
+        if not all_sheet_tickets:
+            log.warning("Не удалось получить тикеты из Google Sheets, очистка отложена.")
+            return
+
+        closed_ticket_ids = {str(t.get('Номер')) for t in all_sheet_tickets if t.get('Статус обращения') == 'Завершено'}
+
+        if not closed_ticket_ids:
+            log.info("В Google Sheets не найдено завершенных тикетов.")
+            return
+
+        bot_tickets_info = bot_data.get('topic_ticket_info', {})
+        topic_ids_to_remove = []
+
+        # Собираем ID топиков для удаления
+        for topic_id, ticket_info in bot_tickets_info.items():
+            entry_id = str(ticket_info.get('entry_id'))
+            if entry_id in closed_ticket_ids:
+                topic_ids_to_remove.append(topic_id)
+
+        # Удаляем найденные тикеты
+        if topic_ids_to_remove:
+            for topic_id in topic_ids_to_remove:
+                bot_tickets_info.pop(topic_id, None)
+            log.info(f"Удалено {len(topic_ids_to_remove)} закрытых тикетов из bot_data.")
+        else:
+            log.info("Не найдено закрытых тикетов в bot_data для очистки.")
+
+    except Exception as e:
+        log.error(f"Произошла ошибка во время очистки закрытых тикетов из bot_data: {e}", exc_info=True)
+
 
 async def post_init_setup(application: Application) -> None:
     """Выполняет настройку после инициализации бота (команды, топики)."""
@@ -2053,42 +2115,53 @@ async def post_init_setup(application: Application) -> None:
 
     # Загружаем ID топиков из БД один раз при старте
     await setup_admin_group_topics(application)
+
+    # Очищаем кэш от старых, уже закрытых тикетов, чтобы не хранить их в памяти
+    await cleanup_closed_tickets_from_bot_data(application)
+
     log.info("--- Завершение post_init_setup ---")
 
 async def update_dashboard(application: Application) -> None:
-    """Собирает информацию о всех тикетах и обновляет сообщение-дашборд."""
+    """Собирает информацию о всех тикетах ИЗ КЭША BOT_DATA и обновляет сообщение-дашборд."""
     bot = application.bot
     bot_data = application.bot_data
     dashboard_topic_id = bot_data.get("dashboard_topic_id")
-    dashboard_message_id = bot_data.get("dashboard_message_id")
     
     if not dashboard_topic_id or not ADMIN_CHAT_ID:
-        log.warning("Dashboard topic ID or ADMIN_CHAT_ID not set, skipping update.")
+        log.warning("Dashboard topic ID или ADMIN_CHAT_ID не установлен, обновление дашборда пропущено.")
         return
 
-    all_tickets = await get_all_tickets()
-    if not all_tickets:
-        log.warning("No tickets found in Google Sheets.")
-        return
+    # Источник данных - кэш в bot_data
+    all_tickets_from_cache = list(bot_data.get('topic_ticket_info', {}).values())
 
-    # Группировка тикетов по статусам
-    new_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Зарегистрировано']
-    in_work_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'В работе']
-    l2_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Эскалация L2']  # Предполагаемый статус
-    l3_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Эскалация L3']  # Предполагаемый статус
-    recovered_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Восстановлено']  # Если есть
+    # Группировка тикетов по их статусам в bot_data
+    new_tickets = sorted([t for t in all_tickets_from_cache if t.get('status') == 'new'], key=lambda x: int(x.get('entry_id', 0)))
+    in_work_tickets = sorted([t for t in all_tickets_from_cache if t.get('status') == 'in_progress'], key=lambda x: int(x.get('entry_id', 0)))
+    l2_tickets = sorted([t for t in all_tickets_from_cache if t.get('status') == 'escalated_l2'], key=lambda x: int(x.get('entry_id', 0)))
+    l3_tickets = sorted([t for t in all_tickets_from_cache if t.get('status') == 'escalated_l3'], key=lambda x: int(x.get('entry_id', 0)))
+    recovered_tickets = sorted([t for t in all_tickets_from_cache if t.get('status') == 'restored'], key=lambda x: int(x.get('entry_id', 0)))
 
-    dashboard_lines = ["📊 <b>Панель управления</b>\n"]
+    dashboard_lines = ["📊 <b>Панель управления</b> (обновлено: " + datetime.now().strftime('%H:%M:%S') + ")\n"]
 
-    # Новые обращения
+    # --- Функция для генерации ссылки на тикет ---
+    def get_ticket_url(ticket_info):
+        topic_id = ticket_info.get('topic_id')
+        if not topic_id:
+            return '#'
+        # Убираем -100 из ID чата для формирования ссылки
+        chat_id_for_url = str(ADMIN_CHAT_ID).replace('-100', '')
+        return f"https://t.me/c/{chat_id_for_url}/{topic_id}"
+
+    # Новые обращения (L1)
     dashboard_lines.append("<b>📥 Новые обращения (L1):</b>")
     if not new_tickets:
         dashboard_lines.append("  <i>Нет новых обращений</i>")
     else:
         for ticket in new_tickets:
-            user_info = f"@{ticket.get('Логин') or ticket.get('ФИО')}"
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> ({html.escape(ticket.get('Тип', ''))}) от {html.escape(user_info)}")
+            user_info = f"@{ticket.get('username') or ticket.get('fio')}"
+            ticket_url = get_ticket_url(ticket)
+            topic_id_str = f" (Тема: {ticket.get('topic_id')})" if ticket.get('topic_id') else ""
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('entry_id')}</a> ({html.escape(ticket.get('feedback_type', ''))}) от {html.escape(user_info)}{topic_id_str}")
 
     dashboard_lines.append("")
 
@@ -2098,44 +2171,51 @@ async def update_dashboard(application: Application) -> None:
         dashboard_lines.append("  <i>Нет обращений в работе</i>")
     else:
         for ticket in in_work_tickets:
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> ({html.escape(ticket.get('Тип', ''))})")
+            user_info = f"@{ticket.get('username') or ticket.get('fio')}"
+            assignee = f" - <i>{html.escape(str(ticket.get('assignee', '')))}</i>" if ticket.get('assignee') else ""
+            ticket_url = get_ticket_url(ticket)
+            topic_id_str = f" (Тема: {ticket.get('topic_id')})" if ticket.get('topic_id') else ""
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('entry_id')}</a> ({html.escape(ticket.get('feedback_type', ''))}) от {html.escape(user_info)}{assignee}{topic_id_str}")
 
     dashboard_lines.append("")
 
-    # Эскалация L2
+    # Эскалация (L2)
     dashboard_lines.append("<b>🛠️ Эскалация (L2):</b>")
     if not l2_tickets:
         dashboard_lines.append("  <i>Нет обращений</i>")
     else:
         for ticket in l2_tickets:
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a>")
+            user_info = f"@{ticket.get('username') or ticket.get('fio')}"
+            ticket_url = get_ticket_url(ticket)
+            topic_id_str = f" (Тема: {ticket.get('topic_id')})" if ticket.get('topic_id') else ""
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('entry_id')}</a> от {html.escape(user_info)}{topic_id_str}")
 
     dashboard_lines.append("")
 
-    # Эскалация L3
+    # Эскалация (L3)
     dashboard_lines.append("<b>💰 Эскалация (L3):</b>")
     if not l3_tickets:
         dashboard_lines.append("  <i>Нет обращений</i>")
     else:
         for ticket in l3_tickets:
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a>")
+            user_info = f"@{ticket.get('username') or ticket.get('fio')}"
+            ticket_url = get_ticket_url(ticket)
+            topic_id_str = f" (Тема: {ticket.get('topic_id')})" if ticket.get('topic_id') else ""
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('entry_id')}</a> от {html.escape(user_info)}{topic_id_str}")
 
     dashboard_lines.append("")
 
-    # Восстановленные, если нужно
+    # Восстановленные обращения
     if recovered_tickets:
         dashboard_lines.append("<b>🔧 Восстановленные обращения:</b>")
         for ticket in recovered_tickets:
-            user_info = f"@{ticket.get('Логин') or ticket.get('ФИО')}"
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> от {html.escape(user_info)}")
+            user_info = f"@{ticket.get('username') or ticket.get('fio')}"
+            ticket_url = get_ticket_url(ticket)
+            topic_id_str = f" (Тема: {ticket.get('topic_id')})" if ticket.get('topic_id') else ""
+            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('entry_id')}</a> от {html.escape(user_info)}{topic_id_str}")
         dashboard_lines.append("")
 
     dashboard_text = "\n".join(dashboard_lines)
-
     dashboard_message_id = bot_data.get("dashboard_message_id")
 
     try:
@@ -2147,8 +2227,9 @@ async def update_dashboard(application: Application) -> None:
                 parse_mode='HTML',
                 disable_web_page_preview=True
             )
-            log.info(f"Дашборд в чате {ADMIN_CHAT_ID} (msg_id: {dashboard_message_id}) ОБНОВЛЕН.")
+            log.info(f"Дашборд в чате {ADMIN_CHAT_ID} (msg_id: {dashboard_message_id}) ОБНОВЛЕН из кэша bot_data.")
         else:
+            log.warning("Не найден 'dashboard_message_id' в bot_data. Попытка создать новое сообщение для дашборда...")
             message = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=dashboard_text,
@@ -2157,17 +2238,17 @@ async def update_dashboard(application: Application) -> None:
                 disable_web_page_preview=True
             )
             bot_data["dashboard_message_id"] = message.message_id
-            await save_state(bot_data)
-            log.info(f"Дашборд создан в чате {ADMIN_CHAT_ID} (msg_id: {message.message_id}).")
+            await set_setting("dashboard_message_id", str(message.message_id))
+            log.info(f"Дашборд создан в чате {ADMIN_CHAT_ID} (msg_id: {message.message_id}) и сохранен в БД.")
 
     except BadRequest as e:
         if "message is not modified" in e.message:
             log.info("Текст дашборда не изменился, обновление пропущено.")
         elif "message to edit not found" in e.message:
             log.warning("Сообщение для дашборда не найдено. Попытка создать новое.")
-            bot_data["dashboard_message_id"] = None
-            await save_state(bot_data)
-            await update_dashboard(application)
+            bot_data.pop("dashboard_message_id", None)
+            await set_setting("dashboard_message_id", "") # Очищаем в БД
+            await update_dashboard(application) # Рекурсивный вызов для создания
         else:
             log.error(f"Ошибка BadRequest при обновлении дашборда: {e}", exc_info=True)
             
@@ -2584,144 +2665,84 @@ async def restore_tickets_from_sheet(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("⛔️ У вас нет прав для выполнения этой команды.")
         return
 
-    await update.message.reply_text("⏳ Начинаю процесс восстановления... Это может занять время.")
+    await update.message.reply_text("⏳ Начинаю процесс восстановления активных тикетов из Google Sheets...")
 
-    all_sheet_tickets = await get_all_tickets()
-    if not all_sheet_tickets:
-        await update.message.reply_text("Не удалось загрузить обращения из таблицы или таблица пуста.")
-        return
-    
-    all_bot_tickets_info = context.bot_data.get('topic_ticket_info', {}).values()
-    existing_entry_ids = {str(t['entry_id']) for t in all_bot_tickets_info}
-    
-    specific_ids_to_restore = {43, 53,61,95,96,141,142,166,169,170,171,178,180,181,185,187,188,194,195,196,197,203,207,215,220,230,231,232,234,235,236,238,239,244,245,248,253,258,264}
-    #specific_ids_to_restore = {44, 289}
-    last_specific_id = max(specific_ids_to_restore) if specific_ids_to_restore else 0
+    try:
+        all_sheet_tickets = await get_all_tickets()
+        if not all_sheet_tickets:
+            await update.message.reply_text("Не удалось загрузить обращения из таблицы или таблица пуста.")
+            return
 
-    restored_count = 0
-    processed_count = 0
-    skipped_exist = 0
-    skipped_condition = 0
-    
-    tickets_to_process = [t for t in all_sheet_tickets] # Копируем список для безопасной работы с индексом
-    current_index = 0
+        bot_tickets_info = context.bot_data.setdefault('topic_ticket_info', {})
+        existing_entry_ids = {str(t['entry_id']) for t in bot_tickets_info.values()}
 
-    while current_index < len(tickets_to_process):
-        ticket_data = tickets_to_process[current_index]
-        processed_count += 1
-        entry_id_str = str(ticket_data.get('Номер', '')).strip()
-        status = str(ticket_data.get('Статус обращения', '')).strip()
+        restored_count = 0
+        skipped_exist = 0
+        skipped_closed = 0
+        skipped_no_topic = 0
 
-        try:
-            entry_id = int(entry_id_str)
-        except (ValueError, TypeError):
-            skipped_condition += 1
-            current_index += 1
-            continue
+        for ticket_data in all_sheet_tickets:
+            status = ticket_data.get('Статус обращения', '').strip()
+            entry_id_str = str(ticket_data.get('Номер', '')).strip()
 
-        if entry_id_str in existing_entry_ids:
-            skipped_exist += 1
-            current_index += 1
-            continue
+            if status == 'Завершено':
+                skipped_closed += 1
+                continue
 
-        should_restore = (entry_id in specific_ids_to_restore) or \
-                         (entry_id > last_specific_id and status != "Завершено")
+            if entry_id_str in existing_entry_ids:
+                skipped_exist += 1
+                continue
 
-        if should_restore:
             try:
-                # Исправляем получение данных и добавляем значения по умолчанию
-                user_id = ticket_data.get('ID Пользователя')
-                fio = ticket_data.get('ФИО') or ''
-                username = ticket_data.get('Логин') or ''
-                feedback_type = ticket_data.get('Тип') or ''
-                platform = ticket_data.get('Площадка') or ''
-                message_text = ticket_data.get('Сообщение') or ''
-                entry_id_str = str(ticket_data.get('Номер'))
-                photo_url = ticket_data.get('Фото (File ID)') or ''
+                topic_id = int(ticket_data.get('Topic ID'))
+            except (ValueError, TypeError):
+                skipped_no_topic += 1
+                log.warning(f"Пропуск восстановления тикета #{entry_id_str}: отсутствует или некорректный Topic ID.")
+                continue
 
-                # 1. Создаем новый топик для тикета (с автоматическим повтором)
-                topic_title = f"[Восстановлено] Обращение #{entry_id_str} от @{username or fio}"
-                ticket_topic = await _execute_with_retry(
-                    context.bot.create_forum_topic,
-                    chat_id=ADMIN_CHAT_ID, name=topic_title
-                )
-                ticket_topic_id = ticket_topic.message_thread_id
+            # Map sheet status to internal status
+            internal_status = 'in_progress' # Default
+            if status == 'Зарегистрировано':
+                internal_status = 'new'
+            elif status in ['В работе', 'На 1 линии', 'На 2 линии', 'На 3 линии']:
+                internal_status = 'in_progress'
+            elif status == 'Эскалация L2':
+                internal_status = 'escalated_l2'
+            elif status == 'Эскалация L3':
+                internal_status = 'escalated_l3'
+            elif status == 'Восстановлено':
+                internal_status = 'restored'
 
-                # Сохраняем информацию о топике
-                if 'topic_ticket_info' not in context.bot_data:
-                    context.bot_data['topic_ticket_info'] = {}
-                
-                current_status = ticket_data.get('Статус обращения', 'В работе')
-                dashboard_status = 'restored' if current_status != 'Завершено' else 'Завершено'
+            # Reconstruct the ticket info for bot_data
+            bot_tickets_info[topic_id] = {
+                'user_id': ticket_data.get('ID Пользователя'),
+                'entry_id': entry_id_str,
+                'fio': ticket_data.get('ФИО', ''),
+                'username': ticket_data.get('Логин', ''),
+                'status': internal_status,
+                'assignee': None, # We can't easily get this, so we leave it None
+                'topic_id': topic_id,
+                'feedback_type': ticket_data.get('Тип', '')
+            }
+            restored_count += 1
+            existing_entry_ids.add(entry_id_str)
 
-                context.bot_data['topic_ticket_info'][ticket_topic_id] = {
-                    'user_id': user_id, 
-                    'entry_id': entry_id_str, 
-                    'fio': fio, 
-                    'username': username, 
-                    'status': dashboard_status,
-                    'assignee': ticket_data.get('Исполнитель'), 
-                    'topic_id': ticket_topic_id, 
-                    'topic_name': topic_title,
-                    'feedback_type': feedback_type
-                }
-
-                # 2. Отправляем полную информацию в новый топик
-                admin_message_lines = [
-                    f"🚨 <b>Восстановленное обращение #{entry_id_str}</b> 🚨", "---",
-                    f"👤 <b>От:</b> {html.escape(fio)}" + (f" (@{html.escape(username)})" if username else ""),
-                    f"🔧 <b>Тип:</b> {html.escape(feedback_type)}", f"📍 <b>Площадка:</b> {html.escape(platform)}", "---",
-                    "<b>Сообщение:</b>", f"{html.escape(message_text)}"
-                ]
-                admin_message = "\n".join(admin_message_lines)
-
-                # Если есть фото, отправляем его (с автоматическим повтором)
-                if photo_url:
-                    try:
-                        await _execute_with_retry(
-                            context.bot.send_photo,
-                            chat_id=ADMIN_CHAT_ID,
-                            message_thread_id=ticket_topic_id,
-                            photo=photo_url,
-                            caption=f"Прикрепленное фото для обращения #{entry_id_str}"
-                        )
-                    except Exception as e:
-                        log.error(f"Не удалось отправить фото (file_id: {photo_url}) для обращения #{entry_id_str}: {e}")
-
-                close_button = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("Закрыть обращение", callback_data=f"close_ticket_{entry_id_str}_{user_id}_{ticket_topic_id}")
-                ]])
-
-                # Отправляем основное сообщение (с автоматическим повтором)
-                await _execute_with_retry(
-                    context.bot.send_message,
-                    chat_id=ADMIN_CHAT_ID, message_thread_id=ticket_topic_id,
-                    text=admin_message, parse_mode=ParseMode.HTML,
-                    reply_markup=close_button
-                )
-                
-                await update_ticket_topic_id(int(entry_id_str), ticket_topic_id)
-                restored_count += 1
-                await asyncio.sleep(2)
-
-            except Exception as e:
-                log.error(f"Не удалось восстановить обращение #{entry_id_str}: {e}")
-        else:
-            skipped_condition += 1
+        summary_message = (
+            f"✅ <b>Процесс восстановления завершен</b>\n\n"
+            f"Всего обработано: {len(all_sheet_tickets)}\n"
+            f"Восстановлено в память: {restored_count}\n"
+            f"Пропущено (уже были в памяти): {skipped_exist}\n"
+            f"Пропущено (уже закрыты): {skipped_closed}\n"
+            f"Пропущено (нет Topic ID): {skipped_no_topic}"
+        )
+        await update.message.reply_text(summary_message, parse_mode=ParseMode.HTML)
         
-        current_index += 1
+        if restored_count > 0:
+            await update_dashboard(context.application)
 
-    summary_message = (
-        f"✅ <b>Процесс восстановления завершен</b>\n\n"
-        f"Всего обработано: {len(tickets_to_process)} обращений\n"
-        f"Восстановлено новых: {restored_count}\n"
-        f"Пропущено (уже существуют): {skipped_exist}\n"
-        f"Пропущено (не подошли по условиям): {skipped_condition}"
-    )
-    await update.message.reply_text(summary_message, parse_mode=ParseMode.HTML)
-    
-    if restored_count > 0:
-        await update_dashboard(context.application)
+    except Exception as e:
+        log.error(f"Ошибка при восстановлении тикетов: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Произошла критическая ошибка: {e}")
 
 async def get_user_profile_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отправляет фотографии пользователя."""
