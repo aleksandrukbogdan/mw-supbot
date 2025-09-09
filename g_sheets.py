@@ -21,6 +21,14 @@ _worksheet_lock = asyncio.Lock()
 _tickets_cache = None
 _cache_lock = asyncio.Lock()
 
+async def _invalidate_cache():
+    """Асинхронный помощник для инвалидации кэша тикетов."""
+    global _tickets_cache
+    async with _cache_lock:
+        if _tickets_cache is not None:
+            _tickets_cache = None
+            log.info("Кэш тикетов был инвалидирован.")
+
 # Словарь с часами на решение по каждому уровню приоритета.
 # Вы можете изменить эти значения при необходимости.
 SLA_HOURS = {
@@ -133,7 +141,13 @@ async def add_feedback(user_id, feedback_type, fio, username, platform, message,
     if not worksheet:
         log.error("Не удалось получить доступ к рабочему листу для добавления отзыва")
         return None
-    return await asyncio.to_thread(_add_feedback_sync, worksheet, user_id, feedback_type, fio, username, platform, message, photo_id)
+
+    new_entry_id = await asyncio.to_thread(_add_feedback_sync, worksheet, user_id, feedback_type, fio, username, platform, message, photo_id)
+
+    if new_entry_id is not None:
+        await _invalidate_cache()
+
+    return new_entry_id
 
 def format_delta(delta):
     """Форматирует timedelta в строку ЧЧ:ММ:СС."""
@@ -178,6 +192,7 @@ async def set_priority_and_sla(entry_id, priority):
         log.error("Не удалось получить доступ к рабочему листу для установки приоритета")
         return
     await asyncio.to_thread(_set_priority_and_sla_sync, worksheet, entry_id, priority)
+    await _invalidate_cache()
 
 def _get_open_tickets_for_sla_check_sync(worksheet):
     log.info("Поиск открытых обращений для проверки sla")
@@ -227,6 +242,7 @@ async def mark_sla_notification_sent(entry_id):
         log.error("Не удалось получить доступ к рабочему листу для отметки SLA-уведомления")
         return
     await asyncio.to_thread(_mark_sla_notification_sent_sync, worksheet, entry_id)
+    await _invalidate_cache()
 
 def _record_action_sync(worksheet, entry_id, action, action_time, status=None):
     try:
@@ -334,6 +350,7 @@ async def record_action(entry_id, action, action_time, status=None):
         log.error("Не удалось получить доступ к рабочему листу для записи действия")
         return
     await asyncio.to_thread(_record_action_sync, worksheet, entry_id, action, action_time, status)
+    await _invalidate_cache()
 
 
 def _update_cell_sync(worksheet, entry_id, column_name, value):
@@ -366,8 +383,7 @@ async def update_ticket_status(entry_id: str, status: str):
     # Дополнительно вызываем record_action для фиксации времени закрытия, если статус "Завершено"
     if status == "Завершено":
         await record_action(entry_id, 'closed', datetime.now(), status=status)
-    global _tickets_cache
-    _tickets_cache = None
+    await _invalidate_cache()
 
 
 async def update_ticket_topic_id(entry_id: int, topic_id: int):
@@ -377,8 +393,7 @@ async def update_ticket_topic_id(entry_id: int, topic_id: int):
         log.error("Не удалось получить доступ к рабочему листу для обновления Topic ID.")
         return
     await asyncio.to_thread(_update_cell_sync, worksheet, entry_id, "Topic ID", topic_id)
-    global _tickets_cache
-    _tickets_cache = None
+    await _invalidate_cache()
 
 
 def _get_all_tickets_sync(worksheet):
@@ -482,5 +497,4 @@ async def update_ticket_url(entry_id: int, url: str):
         log.error("Не удалось получить доступ к рабочему листу для обновления Ticket URL.")
         return
     await asyncio.to_thread(_update_cell_sync, worksheet, entry_id, "Ticket URL", url)
-    global _tickets_cache
-    _tickets_cache = None
+    await _invalidate_cache()
