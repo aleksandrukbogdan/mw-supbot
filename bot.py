@@ -4,6 +4,7 @@ import sys
 import asyncio
 from datetime import datetime, time, timedelta, timezone
 from dotenv import load_dotenv
+from dashboard_storage import save_dashboard_messages, load_dashboard_messages
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, Message, ReplyKeyboardMarkup, InputMediaPhoto, InputMediaDocument, BotCommand, BotCommandScopeChat, BotCommandScopeChatAdministrators, User, ForumTopic
 from telegram.ext import (
     Application,
@@ -1993,13 +1994,16 @@ async def setup_admin_group_topics(application: Application) -> None:
                         message_thread_id=thread_id,
                         text="📊 Панель управления тикетами. Новые обращения будут появляться здесь."
                     )
-                    application.bot_data['dashboard_message_id'] = message_to_pin.message_id
+                    # Новая логика: сохраняем сообщение в JSON
+                    initial_message = [{'id': message_to_pin.message_id, 'timestamp': message_to_pin.date.isoformat()}]
+                    save_dashboard_messages(initial_message)
+
                     await bot.pin_chat_message(
                         chat_id=ADMIN_CHAT_ID,
                         message_id=message_to_pin.message_id,
                         disable_notification=True
                     )
-                    log.info(f"Сообщение в топике Dashboard создано (ID: {message_to_pin.message_id}) и закреплено.")
+                    log.info(f"Сообщение в топике Dashboard создано (ID: {message_to_pin.message_id}), сохранено в JSON и закреплено.")
                     
             except Exception as e:
                 # Вложенный try-except для обработки ошибок создания одного топика
@@ -2056,126 +2060,124 @@ async def post_init_setup(application: Application) -> None:
     log.info("--- Завершение post_init_setup ---")
 
 async def update_dashboard(application: Application) -> None:
-    """Собирает информацию о всех тикетах и обновляет сообщение-дашборд."""
+    """Собирает информацию о тикетах, обновляет или создает сообщения-дашборды."""
     bot = application.bot
     bot_data = application.bot_data
     dashboard_topic_id = bot_data.get("dashboard_topic_id")
-    dashboard_message_id = bot_data.get("dashboard_message_id")
-    
+
     if not dashboard_topic_id or not ADMIN_CHAT_ID:
         log.warning("Dashboard topic ID or ADMIN_CHAT_ID not set, skipping update.")
         return
 
     all_tickets = await get_all_tickets()
     if not all_tickets:
-        log.warning("No tickets found in Google Sheets.")
-        return
-
-    # Группировка тикетов по статусам
-    new_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Зарегистрировано']
-    in_work_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'В работе']
-    l2_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Эскалация L2']  # Предполагаемый статус
-    l3_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Эскалация L3']  # Предполагаемый статус
-    recovered_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Восстановлено']  # Если есть
-
-    dashboard_lines = ["📊 <b>Панель управления</b>\n"]
-
-    # Новые обращения
-    dashboard_lines.append("<b>📥 Новые обращения (L1):</b>")
-    if not new_tickets:
-        dashboard_lines.append("  <i>Нет новых обращений</i>")
+        log.warning("No tickets found in Google Sheets. Clearing dashboard.")
+        dashboard_text = "📊 <b>Панель управления</b>\n\n<i>Нет активных обращений.</i>"
     else:
-        for ticket in new_tickets:
-            user_info = f"@{ticket.get('Логин') or ticket.get('ФИО')}"
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> ({html.escape(ticket.get('Тип', ''))}) от {html.escape(user_info)}")
+        # Группировка тикетов по статусам
+        new_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Зарегистрировано']
+        in_work_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'В работе']
+        l2_tickets = [t for t in all_tickets if 'L2' in t.get('Статус обращения', '')]
+        l3_tickets = [t for t in all_tickets if 'L3' in t.get('Статус обращения', '')]
+        recovered_tickets = [t for t in all_tickets if t.get('Статус обращения') == 'Восстановлено']
 
-    dashboard_lines.append("")
+        dashboard_lines = ["📊 <b>Панель управления</b>\n"]
 
-    # В работе
-    dashboard_lines.append("<b>⚙️ В работе:</b>")
-    if not in_work_tickets:
-        dashboard_lines.append("  <i>Нет обращений в работе</i>")
-    else:
-        for ticket in in_work_tickets:
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> ({html.escape(ticket.get('Тип', ''))})")
+        sections = {
+            "📥 Новые обращения (L1)": new_tickets,
+            "⚙️ В работе": in_work_tickets,
+            "🛠️ Эскалация (L2)": l2_tickets,
+            "💰 Эскалация (L3)": l3_tickets,
+            "🔧 Восстановленные обращения": recovered_tickets,
+        }
 
-    dashboard_lines.append("")
+        for title, tickets in sections.items():
+            dashboard_lines.append(f"<b>{title}:</b>")
+            if not tickets:
+                dashboard_lines.append("  <i>Нет обращений</i>")
+            else:
+                for ticket in tickets:
+                    user_info = f"@{ticket.get('Логин') or ticket.get('ФИО')}"
+                    ticket_url = ticket.get('Ticket URL', '#')
+                    dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> ({html.escape(ticket.get('Тип', ''))}) от {html.escape(user_info)}")
+            dashboard_lines.append("")
 
-    # Эскалация L2
-    dashboard_lines.append("<b>🛠️ Эскалация (L2):</b>")
-    if not l2_tickets:
-        dashboard_lines.append("  <i>Нет обращений</i>")
-    else:
-        for ticket in l2_tickets:
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a>")
+        dashboard_text = "\n".join(dashboard_lines)
 
-    dashboard_lines.append("")
+    # --- Новая логика с несколькими сообщениями ---
+    MAX_MSG_LENGTH = 4096
+    text_chunks = [dashboard_text[i:i + MAX_MSG_LENGTH] for i in range(0, len(dashboard_text), MAX_MSG_LENGTH)]
 
-    # Эскалация L3
-    dashboard_lines.append("<b>💰 Эскалация (L3):</b>")
-    if not l3_tickets:
-        dashboard_lines.append("  <i>Нет обращений</i>")
-    else:
-        for ticket in l3_tickets:
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a>")
+    existing_messages = load_dashboard_messages()
+    new_message_data = []
 
-    dashboard_lines.append("")
+    now = datetime.now(timezone.utc)
+    editable_messages = []
+    for msg in existing_messages:
+        try:
+            # Преобразуем строку в объект datetime с часовым поясом
+            msg_time = datetime.fromisoformat(msg['timestamp'])
+            if now - msg_time < timedelta(hours=47): # 47 часов для запаса
+                editable_messages.append(msg)
+            else:
+                log.info(f"Dashboard message {msg['id']} is older than 48 hours and will be replaced.")
+        except (ValueError, TypeError):
+            log.warning(f"Could not parse timestamp for message {msg['id']}. It will be replaced.")
 
-    # Восстановленные, если нужно
-    if recovered_tickets:
-        dashboard_lines.append("<b>🔧 Восстановленные обращения:</b>")
-        for ticket in recovered_tickets:
-            user_info = f"@{ticket.get('Логин') or ticket.get('ФИО')}"
-            ticket_url = ticket.get('Ticket URL', '#')
-            dashboard_lines.append(f"  - <a href='{ticket_url}'>Обращение #{ticket.get('Номер')}</a> от {html.escape(user_info)}")
-        dashboard_lines.append("")
+    num_to_process = max(len(text_chunks), len(editable_messages))
 
-    dashboard_text = "\n".join(dashboard_lines)
+    for i in range(num_to_process):
+        has_chunk = i < len(text_chunks)
+        has_message = i < len(editable_messages)
 
-    dashboard_message_id = bot_data.get("dashboard_message_id")
+        if has_chunk and has_message:
+            # Редактируем существующее сообщение
+            msg_id = editable_messages[i]['id']
+            timestamp = editable_messages[i]['timestamp']
+            try:
+                await bot.edit_message_text(
+                    chat_id=ADMIN_CHAT_ID,
+                    message_id=msg_id,
+                    text=text_chunks[i],
+                    parse_mode='HTML',
+                    disable_web_page_preview=True
+                )
+                new_message_data.append({'id': msg_id, 'timestamp': timestamp})
+                log.info(f"Dashboard message {msg_id} updated.")
+            except BadRequest as e:
+                if "message to edit not found" in e.message or "message can't be edited" in e.message:
+                    log.warning(f"Message {msg_id} not found or can't be edited. Creating a new one.")
+                    # Если редактирование не удалось, создаем новое сообщение
+                    new_msg = await bot.send_message(
+                        chat_id=ADMIN_CHAT_ID, text=text_chunks[i], message_thread_id=dashboard_topic_id,
+                        parse_mode='HTML', disable_web_page_preview=True
+                    )
+                    new_message_data.append({'id': new_msg.message_id, 'timestamp': new_msg.date.isoformat()})
+                else:
+                    log.error(f"Failed to edit dashboard message {msg_id}: {e}", exc_info=True)
 
-    try:
-        if dashboard_message_id:
-            await bot.edit_message_text(
-                chat_id=ADMIN_CHAT_ID,
-                message_id=dashboard_message_id,
-                text=dashboard_text,
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
-            log.info(f"Дашборд в чате {ADMIN_CHAT_ID} (msg_id: {dashboard_message_id}) ОБНОВЛЕН.")
-        else:
-            message = await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=dashboard_text,
-                message_thread_id=dashboard_topic_id,
-                parse_mode='HTML',
-                disable_web_page_preview=True
-            )
-            bot_data["dashboard_message_id"] = message.message_id
-            await save_state(bot_data)
-            log.info(f"Дашборд создан в чате {ADMIN_CHAT_ID} (msg_id: {message.message_id}).")
+        elif has_chunk:
+            # Создаем новое сообщение, так как чанков больше, чем сообщений
+            try:
+                new_msg = await bot.send_message(
+                    chat_id=ADMIN_CHAT_ID, text=text_chunks[i], message_thread_id=dashboard_topic_id,
+                    parse_mode='HTML', disable_web_page_preview=True
+                )
+                new_message_data.append({'id': new_msg.message_id, 'timestamp': new_msg.date.isoformat()})
+                log.info(f"New dashboard message created with id {new_msg.message_id}.")
+            except Exception as e:
+                log.error(f"Failed to send new dashboard message: {e}", exc_info=True)
 
-    except BadRequest as e:
-        if "message is not modified" in e.message:
-            log.info("Текст дашборда не изменился, обновление пропущено.")
-        elif "message to edit not found" in e.message:
-            log.warning("Сообщение для дашборда не найдено. Попытка создать новое.")
-            bot_data["dashboard_message_id"] = None
-            await save_state(bot_data)
-            await update_dashboard(application)
-        else:
-            log.error(f"Ошибка BadRequest при обновлении дашборда: {e}", exc_info=True)
-            
-    except Forbidden:
-        log.error(f"Недостаточно прав для обновления дашборда в чате {ADMIN_CHAT_ID}.")
-        
-    except Exception as e:
-        log.error(f"Непредвиденная ошибка при обновлении дашборда: {e}", exc_info=True)
+        elif has_message:
+            # Удаляем лишние сообщения
+            msg_id = editable_messages[i]['id']
+            try:
+                await bot.delete_message(chat_id=ADMIN_CHAT_ID, message_id=msg_id)
+                log.info(f"Extra dashboard message {msg_id} deleted.")
+            except Exception as e:
+                log.warning(f"Failed to delete extra dashboard message {msg_id}: {e}")
+
+    save_dashboard_messages(new_message_data)
 
 # Список быстрых ответов
 ANSWERS = [
@@ -2416,6 +2418,10 @@ async def recreate_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for key in topic_keys_to_remove:
             context.application.bot_data.pop(key, None)
         log.info("Данные о топиках в bot_data очищены.")
+
+        # Новая логика: очищаем JSON-файл с сообщениями дашборда
+        save_dashboard_messages([])
+        log.info("JSON-файл с сообщениями дашборда очищен.")
 
         # 3. Запускаем процедуру создания заново
         await setup_admin_group_topics(context.application)
